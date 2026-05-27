@@ -64,6 +64,15 @@ public sealed class BackendHttpClient : IDisposable
         return toolsResponse?.Tools ?? [];
     }
 
+    public async Task<IReadOnlyList<ProposedToolDto>> GetProposedToolsAsync(CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync("/proposed-tools", cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var toolsResponse = await response.Content.ReadFromJsonAsync<ProposedToolListResponseDto>(JsonOptions, cancellationToken);
+        return toolsResponse?.Tools ?? [];
+    }
+
     public async Task ApprovePermissionAsync(string permissionId, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.PostAsync($"/permissions/{permissionId}/approve", content: null, cancellationToken);
@@ -73,6 +82,24 @@ public sealed class BackendHttpClient : IDisposable
     public async Task RejectPermissionAsync(string permissionId, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.PostAsync($"/permissions/{permissionId}/reject", content: null, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task ApproveProposedToolAsync(string toolId, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.PostAsync($"/proposed-tools/{toolId}/approve", content: null, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task RejectProposedToolAsync(string toolId, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.PostAsync($"/proposed-tools/{toolId}/reject", content: null, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task MarkProposedToolNeedsChangesAsync(string toolId, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.PostAsync($"/proposed-tools/{toolId}/needs-changes", content: null, cancellationToken);
         response.EnsureSuccessStatusCode();
     }
 

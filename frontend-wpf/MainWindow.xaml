@@ -73,12 +73,27 @@
 
         <DataTemplate x:Key="ProposedToolTemplate">
             <StackPanel Margin="0,0,0,14">
-                <TextBlock Text="{Binding}" FontWeight="SemiBold" Foreground="{StaticResource PrimaryTextBrush}" />
-                <TextBlock Text="Status: not implemented" Style="{StaticResource MutedTextStyle}" Margin="0,2,0,8" />
+                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource PrimaryTextBrush}" />
+                <TextBlock Text="{Binding StatusLine}" Style="{StaticResource MutedTextStyle}" Margin="0,2,0,0" />
+                <TextBlock Text="{Binding RiskLine}" Style="{StaticResource MutedTextStyle}" />
+                <TextBlock Text="{Binding ReasonLine}" Style="{StaticResource MutedTextStyle}" />
+                <TextBlock Text="{Binding InputSchemaText}" Style="{StaticResource MutedTextStyle}" />
+                <TextBlock Text="{Binding OutputSchemaText}" Style="{StaticResource MutedTextStyle}" Margin="0,0,0,8" />
                 <StackPanel Orientation="Horizontal">
-                    <Button Content="Approve later" IsEnabled="False" Padding="10,5" Margin="0,0,8,0" />
-                    <Button Content="Reject" IsEnabled="False" Padding="10,5" Margin="0,0,8,0" />
-                    <Button Content="Open spec" IsEnabled="False" Padding="10,5" />
+                    <Button Content="Approve"
+                            Command="{Binding DataContext.ApproveProposedToolCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                            CommandParameter="{Binding Id}"
+                            Padding="10,5"
+                            Margin="0,0,8,0" />
+                    <Button Content="Reject"
+                            Command="{Binding DataContext.RejectProposedToolCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                            CommandParameter="{Binding Id}"
+                            Padding="10,5"
+                            Margin="0,0,8,0" />
+                    <Button Content="Needs changes"
+                            Command="{Binding DataContext.NeedsChangesProposedToolCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                            CommandParameter="{Binding Id}"
+                            Padding="10,5" />
                 </StackPanel>
             </StackPanel>
         </DataTemplate>
@@ -333,9 +348,9 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="Mock Proposed Tools" Style="{StaticResource PanelTitleStyle}" />
+                            <TextBlock Grid.Row="0" Text="Proposed Tools" Style="{StaticResource PanelTitleStyle}" />
                             <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
-                                <ItemsControl ItemsSource="{Binding MockProposedTools}" ItemTemplate="{StaticResource ProposedToolTemplate}" />
+                                <ItemsControl ItemsSource="{Binding ProposedTools}" ItemTemplate="{StaticResource ProposedToolTemplate}" />
                             </ScrollViewer>
                         </Grid>
                     </Border>

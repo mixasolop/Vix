@@ -35,6 +35,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         SendCommand = new AsyncRelayCommand(SendAsync, CanSend);
         ApprovePermissionCommand = new AsyncRelayCommand(ApprovePermissionAsync, HasPendingPermission);
         RejectPermissionCommand = new AsyncRelayCommand(RejectPermissionAsync, HasPendingPermission);
+        ApproveProposedToolCommand = new AsyncRelayCommand(ApproveProposedToolAsync, HasProposedToolId);
+        RejectProposedToolCommand = new AsyncRelayCommand(RejectProposedToolAsync, HasProposedToolId);
+        NeedsChangesProposedToolCommand = new AsyncRelayCommand(NeedsChangesProposedToolAsync, HasProposedToolId);
 
         PermissionItems.Add("No pending permissions");
         ImplementedTools.Add("Backend not connected");
@@ -45,9 +48,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         RecentToolCalls.Add("No tool calls yet");
         FailedToolCalls.Add("No failed tool calls");
         PermissionHistory.Add("No permission history yet");
-        MockProposedTools.Add("search_files - not implemented");
-        MockProposedTools.Add("open_file - not implemented");
-        MockProposedTools.Add("capture_active_window - not implemented");
 
         RefreshSettings();
     }
@@ -59,6 +59,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public AsyncRelayCommand ApprovePermissionCommand { get; }
 
     public AsyncRelayCommand RejectPermissionCommand { get; }
+
+    public AsyncRelayCommand ApproveProposedToolCommand { get; }
+
+    public AsyncRelayCommand RejectProposedToolCommand { get; }
+
+    public AsyncRelayCommand NeedsChangesProposedToolCommand { get; }
 
     public string DraftInput
     {
@@ -120,7 +126,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public ObservableCollection<string> PermissionHistory { get; } = [];
 
-    public ObservableCollection<string> MockProposedTools { get; } = [];
+    public ObservableCollection<ProposedToolDto> ProposedTools { get; } = [];
 
     public ObservableCollection<StatusItem> Settings { get; } = [];
 
@@ -143,6 +149,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
             SetBackendStatus("Connected", "Backend is available at http://127.0.0.1:8000.");
             await LoadRegisteredToolsAsync(_shutdown.Token);
+            await LoadProposedToolsAsync(_shutdown.Token);
             _isReady = true;
             SendCommand.RaiseCanExecuteChanged();
         }
@@ -241,6 +248,44 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         return !string.IsNullOrWhiteSpace(_currentPermissionId);
     }
 
+    private static bool HasProposedToolId(object? parameter)
+    {
+        return parameter is string value && !string.IsNullOrWhiteSpace(value);
+    }
+
+    private async Task ApproveProposedToolAsync(object? parameter)
+    {
+        if (parameter is not string toolId || string.IsNullOrWhiteSpace(toolId))
+        {
+            return;
+        }
+
+        await _backendHttpClient.ApproveProposedToolAsync(toolId, _shutdown.Token);
+        await LoadProposedToolsAsync(_shutdown.Token);
+    }
+
+    private async Task RejectProposedToolAsync(object? parameter)
+    {
+        if (parameter is not string toolId || string.IsNullOrWhiteSpace(toolId))
+        {
+            return;
+        }
+
+        await _backendHttpClient.RejectProposedToolAsync(toolId, _shutdown.Token);
+        await LoadProposedToolsAsync(_shutdown.Token);
+    }
+
+    private async Task NeedsChangesProposedToolAsync(object? parameter)
+    {
+        if (parameter is not string toolId || string.IsNullOrWhiteSpace(toolId))
+        {
+            return;
+        }
+
+        await _backendHttpClient.MarkProposedToolNeedsChangesAsync(toolId, _shutdown.Token);
+        await LoadProposedToolsAsync(_shutdown.Token);
+    }
+
     private void ApplyPlan(PlanDto plan)
     {
         GoalTitle = string.IsNullOrWhiteSpace(plan.Goal)
@@ -337,6 +382,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 _currentPermissionId = null;
                 ApprovePermissionCommand.RaiseCanExecuteChanged();
                 RejectPermissionCommand.RaiseCanExecuteChanged();
+                break;
+
+            case "proposed_tool_created":
+            case "proposed_tool_approved":
+            case "proposed_tool_rejected":
+            case "proposed_tool_needs_changes":
+                ApplyProposedToolIfPresent(assistantEvent.Data);
                 break;
 
             case "error_occurred":
@@ -475,6 +527,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    private async Task LoadProposedToolsAsync(CancellationToken cancellationToken)
+    {
+        var proposedTools = await _backendHttpClient.GetProposedToolsAsync(cancellationToken);
+        ProposedTools.Clear();
+        foreach (var proposedTool in proposedTools)
+        {
+            ProposedTools.Add(proposedTool);
+        }
+    }
+
     private void AddPermissionHistory(Dictionary<string, object?> data, string status)
     {
         var permissionId = GetString(data, "permission_id");
@@ -517,6 +579,34 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             ApplyPlan(plan);
         }
+    }
+
+    private void ApplyProposedToolIfPresent(Dictionary<string, object?> data)
+    {
+        if (!data.TryGetValue("tool", out var value))
+        {
+            return;
+        }
+
+        var proposedTool = DeserializeValue<ProposedToolDto>(value);
+        if (proposedTool is not null)
+        {
+            UpsertProposedTool(proposedTool);
+        }
+    }
+
+    private void UpsertProposedTool(ProposedToolDto proposedTool)
+    {
+        for (var index = 0; index < ProposedTools.Count; index++)
+        {
+            if (ProposedTools[index].Id == proposedTool.Id)
+            {
+                ProposedTools[index] = proposedTool;
+                return;
+            }
+        }
+
+        ProposedTools.Insert(0, proposedTool);
     }
 
     private static T? DeserializeValue<T>(object? value)

@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using System.Text.Json;
 
 namespace DesktopAssistant.Frontend.Dtos;
 
@@ -75,6 +76,58 @@ public sealed class ToolDefinitionDto
 
     [JsonPropertyName("status")]
     public string Status { get; set; } = string.Empty;
+}
+
+public sealed class ProposedToolListResponseDto
+{
+    [JsonPropertyName("tools")]
+    public List<ProposedToolDto> Tools { get; set; } = [];
+}
+
+public sealed class ProposedToolDto
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("description")]
+    public string Description { get; set; } = string.Empty;
+
+    [JsonPropertyName("reason")]
+    public string Reason { get; set; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [JsonPropertyName("risk_level")]
+    public string RiskLevel { get; set; } = string.Empty;
+
+    [JsonPropertyName("input_schema")]
+    public Dictionary<string, object?> InputSchema { get; set; } = [];
+
+    [JsonPropertyName("output_schema")]
+    public Dictionary<string, object?> OutputSchema { get; set; } = [];
+
+    [JsonPropertyName("created_from_message")]
+    public string CreatedFromMessage { get; set; } = string.Empty;
+
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = string.Empty;
+
+    [JsonPropertyName("updated_at")]
+    public string UpdatedAt { get; set; } = string.Empty;
+
+    public string StatusLine => $"Status: {Status}";
+
+    public string RiskLine => $"Risk: {RiskLevel}";
+
+    public string ReasonLine => $"Reason: {Reason}";
+
+    public string InputSchemaText => $"Input schema: {JsonSerializer.Serialize(InputSchema)}";
+
+    public string OutputSchemaText => $"Output schema: {JsonSerializer.Serialize(OutputSchema)}";
 }
 
 public sealed class AssistantEventDto

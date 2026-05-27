@@ -11,6 +11,7 @@ from app.events.event_bus import EventBus
 from app.schemas.chat import ChatAcceptedResponse, ChatRequest
 from app.schemas.events import AssistantEvent
 from app.schemas.plans import Plan, PlanStep, PlanStepStatus
+from app.schemas.proposed_tools import CreateProposedToolRequest, ProposedTool
 from app.schemas.tools import PermissionDecisionResponse, PermissionPreview, PermissionRequest, ToolCall, ToolDefinition
 from app.tools.registry import ToolRegistry
 
@@ -116,6 +117,12 @@ class Orchestrator:
             proposal = self._planner.propose_tool_call(normalized_message)
             if proposal is None:
                 LOGGER.info("planner produced no tool call | session=%s | run=%s", session_id, run_id)
+                proposed_tool = await self._propose_missing_tool(session_id, run_id, normalized_message)
+                if proposed_tool is not None:
+                    assistant_message = f"I cannot do this yet, but I proposed a new tool: {proposed_tool.name}."
+                    await self._finish_without_tool(session_id, run_id, assistant_message)
+                    return
+
                 assistant_message = await self._llm_client.complete([{"role": "user", "content": normalized_message}])
                 await self._finish_without_tool(session_id, run_id, assistant_message or FALLBACK_MESSAGE)
                 return
@@ -270,6 +277,13 @@ class Orchestrator:
             result=result.output,
             error=result.error,
         )
+        if result.status != "success":
+            self._database.create_reflection(
+                session_id=session_id,
+                run_id=run_id,
+                source_type="failed_tool",
+                note=f"Tool {tool_name} failed with error: {result.error or 'unknown error'}.",
+            )
 
         final_status = PlanStepStatus.completed if result.status == "success" else PlanStepStatus.failed
         final_plan = self._plan_with_statuses(selected_plan, select_status=PlanStepStatus.completed, execute_status=final_status)
@@ -302,10 +316,50 @@ class Orchestrator:
         self._database.log_message(session_id, "assistant", assistant_message)
         await self._emit("assistant_message_created", session_id, run_id, {"role": "assistant", "message": assistant_message})
 
+    async def _propose_missing_tool(self, session_id: str, run_id: str, user_message: str) -> ProposedTool | None:
+        draft = await self._llm_client.propose_tool_spec(user_message, self._registry.list_tools())
+        if draft is None:
+            return None
+
+        proposed_tool = self._database.create_proposed_tool(
+            CreateProposedToolRequest(
+                name=draft.name,
+                description=draft.description,
+                reason=draft.reason,
+                risk_level=draft.risk_level,
+                input_schema=draft.input_schema,
+                output_schema=draft.output_schema,
+                created_from_message=user_message,
+            )
+        )
+        self._database.create_reflection(
+            session_id=session_id,
+            run_id=run_id,
+            source_type="missing_tool",
+            note=f"User asked for unsupported capability. Proposed {proposed_tool.name}: {proposed_tool.reason}",
+        )
+        await self._emit_proposed_tool("proposed_tool_created", session_id, run_id, proposed_tool)
+        return proposed_tool
+
     async def _fail_run(self, session_id: str, run_id: str, message: str) -> None:
         await self._emit("error_occurred", session_id, run_id, {"message": message})
         self._database.log_message(session_id, "assistant", message)
         await self._emit("assistant_message_created", session_id, run_id, {"role": "assistant", "message": message})
+
+    async def _emit_proposed_tool(self, event_type: str, session_id: str, run_id: str, proposed_tool: ProposedTool) -> None:
+        await self._emit(
+            event_type,
+            session_id,
+            run_id,
+            {
+                "tool_id": proposed_tool.id,
+                "name": proposed_tool.name,
+                "reason": proposed_tool.reason,
+                "risk_level": proposed_tool.risk_level,
+                "status": proposed_tool.status.value,
+                "tool": proposed_tool.model_dump(mode="json"),
+            },
+        )
 
     async def _emit_plan(self, event_type: str, session_id: str, run_id: str, plan: Plan) -> None:
         await self._emit(event_type, session_id, run_id, {"plan": plan.model_dump(mode="json")})

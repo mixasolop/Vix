@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.db.models import EventRecord, MessageRecord
 from app.schemas.events import AssistantEvent
+from app.schemas.proposed_tools import CreateProposedToolRequest, ProposedTool, ProposedToolStatus
 
 
 class Database:
@@ -99,6 +100,36 @@ class Database:
                 description TEXT NOT NULL,
                 metadata_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proposed_tools (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                input_schema_json TEXT NOT NULL,
+                output_schema_json TEXT NOT NULL,
+                created_from_message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reflections (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                run_id TEXT,
+                source_type TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
         )
@@ -278,10 +309,97 @@ class Database:
         ]
 
     def count_rows(self, table_name: str) -> int:
-        if table_name not in {"sessions", "messages", "events", "tool_calls", "permissions", "tools"}:
+        if table_name not in {"sessions", "messages", "events", "tool_calls", "permissions", "tools", "proposed_tools", "reflections"}:
             raise ValueError(f"Unsupported table name: {table_name}")
         connection = self._ensure_connection()
         return int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+    def create_proposed_tool(
+        self,
+        request: CreateProposedToolRequest,
+        status: ProposedToolStatus = ProposedToolStatus.proposed,
+    ) -> ProposedTool:
+        connection = self._ensure_connection()
+        now = self._now_iso()
+        tool_id = f"ptool_{uuid4()}"
+        connection.execute(
+            """
+            INSERT INTO proposed_tools
+                (id, name, description, reason, status, risk_level, input_schema_json, output_schema_json, created_from_message, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tool_id,
+                request.name,
+                request.description,
+                request.reason,
+                status.value,
+                request.risk_level,
+                json.dumps(request.input_schema, sort_keys=True),
+                json.dumps(request.output_schema, sort_keys=True),
+                request.created_from_message,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+        proposed_tool = self.get_proposed_tool(tool_id)
+        if proposed_tool is None:
+            raise RuntimeError(f"Failed to create proposed tool: {request.name}")
+        return proposed_tool
+
+    def list_proposed_tools(self) -> list[ProposedTool]:
+        connection = self._ensure_connection()
+        rows = connection.execute(
+            """
+            SELECT id, name, description, reason, status, risk_level, input_schema_json, output_schema_json, created_from_message, created_at, updated_at
+            FROM proposed_tools
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return [self._proposed_tool_from_row(row) for row in rows]
+
+    def get_proposed_tool(self, tool_id: str) -> ProposedTool | None:
+        connection = self._ensure_connection()
+        row = connection.execute(
+            """
+            SELECT id, name, description, reason, status, risk_level, input_schema_json, output_schema_json, created_from_message, created_at, updated_at
+            FROM proposed_tools
+            WHERE id = ?
+            """,
+            (tool_id,),
+        ).fetchone()
+        return self._proposed_tool_from_row(row) if row is not None else None
+
+    def update_proposed_tool_status(self, tool_id: str, status: ProposedToolStatus) -> ProposedTool | None:
+        connection = self._ensure_connection()
+        connection.execute(
+            "UPDATE proposed_tools SET status = ?, updated_at = ? WHERE id = ?",
+            (status.value, self._now_iso(), tool_id),
+        )
+        connection.commit()
+        return self.get_proposed_tool(tool_id)
+
+    def create_reflection(
+        self,
+        session_id: str | None,
+        run_id: str | None,
+        source_type: str,
+        note: str,
+    ) -> str:
+        if session_id is not None:
+            self.ensure_session(session_id)
+        reflection_id = str(uuid4())
+        connection = self._ensure_connection()
+        connection.execute(
+            """
+            INSERT INTO reflections (id, session_id, run_id, source_type, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (reflection_id, session_id, run_id, source_type, note, self._now_iso()),
+        )
+        connection.commit()
+        return reflection_id
 
     def upsert_tools(self, tools: list[object]) -> None:
         connection = self._ensure_connection()
@@ -331,6 +449,22 @@ class Database:
             row[1]
             for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         }
+
+    @staticmethod
+    def _proposed_tool_from_row(row) -> ProposedTool:
+        return ProposedTool(
+            id=row[0],
+            name=row[1],
+            description=row[2],
+            reason=row[3],
+            status=ProposedToolStatus(row[4]),
+            risk_level=row[5],
+            input_schema=json.loads(row[6]),
+            output_schema=json.loads(row[7]),
+            created_from_message=row[8],
+            created_at=row[9],
+            updated_at=row[10],
+        )
 
     @staticmethod
     def _now_iso() -> str:

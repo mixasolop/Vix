@@ -7,11 +7,12 @@ from fastapi import FastAPI
 
 from app.api.chat_routes import router as chat_router
 from app.api.permission_routes import router as permission_router
+from app.api.proposed_tool_routes import router as proposed_tool_router
 from app.api.tool_routes import router as tool_router
-from app.assistant.llm_client import LLMClient
+from app.assistant.llm_client import DeterministicLLMClient, LLMClient, OpenAILLMClient
 from app.assistant.orchestrator import Orchestrator
 from app.assistant.policy import PermissionManager, PolicyEngine
-from app.config import load_config
+from app.config import AppConfig, load_config
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.logging_config import configure_logging
@@ -32,6 +33,7 @@ def create_app(
     database = Database(database_path or config.database_path)
     event_bus = EventBus()
     registry = registry or build_default_registry()
+    llm_client = llm_client or _build_llm_client(config)
     permission_manager = PermissionManager(database)
     policy_engine = PolicyEngine()
     orchestrator = Orchestrator(
@@ -70,7 +72,7 @@ def create_app(
     app = FastAPI(
         title="Desktop Assistant Backend",
         version="0.1.0",
-        description="Stage 1.9 deterministic local assistant runtime.",
+        description="Stage 2 safe tool proposal and review runtime.",
         lifespan=lifespan,
     )
     app.state.config = config
@@ -86,14 +88,30 @@ def create_app(
         return {
             "status": "ok",
             "service": "desktop-assistant-backend",
-            "stage": "1.9",
+            "stage": "2.0",
         }
 
     app.include_router(chat_router)
     app.include_router(tool_router)
     app.include_router(permission_router)
+    app.include_router(proposed_tool_router)
     app.include_router(event_stream_router)
     return app
+
+
+def _build_llm_client(config: AppConfig) -> LLMClient:
+    if not config.ai_proposals_enabled:
+        return DeterministicLLMClient()
+
+    if config.ai_provider.lower() != "openai":
+        LOGGER.warning("AI proposals disabled because unsupported AI_PROVIDER=%s", config.ai_provider)
+        return DeterministicLLMClient()
+
+    if not config.openai_api_key:
+        LOGGER.warning("AI proposals disabled because OPENAI_API_KEY is not configured")
+        return DeterministicLLMClient()
+
+    return OpenAILLMClient(api_key=config.openai_api_key, model=config.ai_proposal_model)
 
 
 app = create_app()
