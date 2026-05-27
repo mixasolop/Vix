@@ -6,7 +6,9 @@ from pydantic import BaseModel, Field
 class PlanStepStatus(str, Enum):
     pending = "pending"
     in_progress = "in_progress"
+    running = "running"
     completed = "completed"
+    failed = "failed"
     skipped = "skipped"
 
 

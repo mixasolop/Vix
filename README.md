@@ -1,13 +1,13 @@
 # Desktop Assistant
 
-Stage 1.1 and 1.2 scaffold for a Windows-only desktop assistant.
+Stage 1 scaffold for a Windows-only desktop assistant.
 
 ## What exists now
 
-- `frontend-wpf/`: WPF shell that starts idle, accepts user text, and displays backend responses.
-- `backend/`: FastAPI skeleton with fake chat planning, fake tool result, tool registry contracts, permission routes, WebSocket event stream, and SQLite event logging.
+- `frontend-wpf/`: WPF shell that starts idle, accepts user text, posts runs, and renders backend WebSocket events.
+- `backend/`: FastAPI backend with accepted-run `/chat`, live event stream, tool registry/runtime, permission routes, and SQLite trace storage.
 
-The WPF app does not plan, execute tools, or store memory. It only sends user input to the Python backend and displays returned state.
+The WPF app does not plan, execute tools, or store memory. It only sends user decisions to Python and displays backend event state.
 
 ## Frontend
 
@@ -37,7 +37,7 @@ Run the API:
 
 ```powershell
 cd .\backend
-uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Endpoints included:

@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,9 +13,13 @@ from app.assistant.policy import PermissionManager
 from app.config import load_config
 from app.db.database import Database
 from app.events.event_bus import EventBus
+from app.logging_config import configure_logging
 from app.tools.registry import build_default_registry
 from app.tools.registry import ToolRegistry
 from app.ws.event_stream import router as event_stream_router
+
+configure_logging()
+LOGGER = logging.getLogger("app.main")
 
 
 def create_app(database_path: str | Path | None = None, registry: ToolRegistry | None = None) -> FastAPI:
@@ -32,9 +37,27 @@ def create_app(database_path: str | Path | None = None, registry: ToolRegistry |
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        LOGGER.info("backend startup beginning")
         app.state.database.initialize()
-        yield
-        app.state.database.close()
+        app.state.database.upsert_tools(app.state.registry.list_tools())
+        tools = app.state.registry.list_tools()
+        implemented_count = sum(1 for tool in tools if tool.status.value == "implemented")
+        planned_count = sum(1 for tool in tools if tool.status.value == "planned")
+        disabled_count = sum(1 for tool in tools if tool.status.value == "disabled")
+        LOGGER.info(
+            "backend ready | database=%s | tools=%s implemented=%s planned=%s disabled=%s | health=http://127.0.0.1:8000/health | ws=ws://127.0.0.1:8000/ws/events",
+            app.state.database.path,
+            len(tools),
+            implemented_count,
+            planned_count,
+            disabled_count,
+        )
+        try:
+            yield
+        finally:
+            LOGGER.info("backend shutdown beginning")
+            app.state.database.close()
+            LOGGER.info("backend shutdown complete")
 
     app = FastAPI(
         title="Desktop Assistant Backend",

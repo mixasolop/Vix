@@ -1,6 +1,9 @@
+import logging
 import subprocess
 
 from app.schemas.tools import ToolResult
+
+LOGGER = logging.getLogger("app.tools.system")
 
 
 SAFE_APP_COMMANDS: dict[str, str] = {
@@ -19,8 +22,10 @@ SAFE_APP_COMMANDS: dict[str, str] = {
 
 async def launch_app(arguments: dict[str, object]) -> ToolResult:
     app_name = str(arguments.get("app_name", "")).strip().lower()
+    LOGGER.info("launch_app requested | app_name=%s", app_name)
     command = SAFE_APP_COMMANDS.get(app_name)
     if command is None:
+        LOGGER.warning("launch_app rejected | app_name=%s | reason=not_whitelisted", app_name)
         return ToolResult(
             tool="launch_app",
             status="failed",
@@ -28,7 +33,19 @@ async def launch_app(arguments: dict[str, object]) -> ToolResult:
             error=f"Unsupported app '{app_name}'. Allowed apps: calculator, explorer, notepad, paint.",
         )
 
-    process = subprocess.Popen([command], close_fds=True)
+    try:
+        process = subprocess.Popen([command], close_fds=True)
+    except FileNotFoundError:
+        LOGGER.exception("launch_app failed | command=%s | reason=file_not_found", command)
+        return ToolResult(tool="launch_app", status="failed", output={}, error=f"Command was not found: {command}.")
+    except PermissionError:
+        LOGGER.exception("launch_app failed | command=%s | reason=permission_denied", command)
+        return ToolResult(tool="launch_app", status="failed", output={}, error=f"Permission denied while launching {command}.")
+    except OSError as exc:
+        LOGGER.exception("launch_app failed | command=%s | reason=os_error", command)
+        return ToolResult(tool="launch_app", status="failed", output={}, error=f"Failed to launch {command}: {exc}")
+
+    LOGGER.info("launch_app started process | command=%s | pid=%s", command, process.pid)
     return ToolResult(
         tool="launch_app",
         status="success",

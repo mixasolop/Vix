@@ -11,22 +11,16 @@ public sealed class ChatRequestDto
     public string? ConversationId { get; set; }
 }
 
-public sealed class ChatResponseDto
+public sealed class ChatAcceptedDto
 {
+    [JsonPropertyName("accepted")]
+    public bool Accepted { get; set; }
+
     [JsonPropertyName("conversation_id")]
     public string ConversationId { get; set; } = string.Empty;
 
-    [JsonPropertyName("assistant_message")]
-    public string AssistantMessage { get; set; } = string.Empty;
-
-    [JsonPropertyName("plan")]
-    public PlanDto Plan { get; set; } = new();
-
-    [JsonPropertyName("tool_calls")]
-    public List<ToolCallDto> ToolCalls { get; set; } = [];
-
-    [JsonPropertyName("permissions")]
-    public List<PermissionRequestDto> Permissions { get; set; } = [];
+    [JsonPropertyName("run_id")]
+    public string RunId { get; set; } = string.Empty;
 }
 
 public sealed class PlanDto
@@ -68,18 +62,6 @@ public sealed class ToolCallDto
     public string? Error { get; set; }
 }
 
-public sealed class PermissionRequestDto
-{
-    [JsonPropertyName("permission_id")]
-    public string PermissionId { get; set; } = string.Empty;
-
-    [JsonPropertyName("tool")]
-    public string Tool { get; set; } = string.Empty;
-
-    [JsonPropertyName("reason")]
-    public string Reason { get; set; } = string.Empty;
-}
-
 public sealed class ToolListResponseDto
 {
     [JsonPropertyName("tools")]
@@ -97,15 +79,21 @@ public sealed class ToolDefinitionDto
 
 public sealed class AssistantEventDto
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; } = string.Empty;
+    [JsonPropertyName("event_id")]
+    public string EventId { get; set; } = string.Empty;
+
+    [JsonPropertyName("session_id")]
+    public string? SessionId { get; set; }
+
+    [JsonPropertyName("run_id")]
+    public string? RunId { get; set; }
 
     [JsonPropertyName("type")]
     public string Type { get; set; } = string.Empty;
 
-    [JsonPropertyName("payload")]
-    public Dictionary<string, object?> Payload { get; set; } = [];
+    [JsonPropertyName("data")]
+    public Dictionary<string, object?> Data { get; set; } = [];
 
-    [JsonPropertyName("created_at")]
-    public DateTimeOffset CreatedAt { get; set; }
+    [JsonPropertyName("timestamp")]
+    public DateTimeOffset Timestamp { get; set; }
 }

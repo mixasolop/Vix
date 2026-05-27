@@ -5,8 +5,9 @@ from datetime import datetime
 @dataclass(frozen=True)
 class EventRecord:
     id: str
+    session_id: str | None
     type: str
-    payload_json: str
+    data_json: str
     created_at: datetime
 
 

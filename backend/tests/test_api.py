@@ -34,6 +34,14 @@ def test_health(client: TestClient) -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_sqlite_runtime_pragmas_and_tools_table(client: TestClient) -> None:
+    database = client.app.state.database
+
+    assert database.get_pragma("journal_mode") == "wal"
+    assert database.get_pragma("busy_timeout") == "5000"
+    assert database.count_rows("tools") >= 1
+
+
 def test_tools_endpoint_lists_stage_one_contracts(client: TestClient) -> None:
     response = client.get("/tools")
 
@@ -43,51 +51,53 @@ def test_tools_endpoint_lists_stage_one_contracts(client: TestClient) -> None:
     assert tools["transcribe_audio"]["status"] == "planned"
 
 
-def test_chat_returns_fake_plan_and_tool_trace(client: TestClient) -> None:
+def test_chat_returns_acceptance_only(client: TestClient) -> None:
     response = client.post("/chat", json={"message": "open notepad"})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["plan"]["goal"] == "Open Notepad"
-    assert body["tool_calls"][0]["tool"] == "launch_app"
-    assert body["tool_calls"][0]["status"] == "success"
-    assert body["assistant_message"] == "Test launch for notepad."
+    assert body["accepted"] is True
+    assert body["conversation_id"].startswith("sess_")
+    assert body["run_id"].startswith("run_")
+    assert "assistant_message" not in body
+    assert "tool_calls" not in body
 
 
-def test_chat_persists_trace_tables(client: TestClient) -> None:
-    response = client.post("/chat", json={"message": "open notepad"})
-
-    assert response.status_code == 200
-    database = client.app.state.database
-    assert database.count_rows("sessions") == 1
-    assert database.count_rows("messages") == 2
-    assert database.count_rows("events") >= 5
-    assert database.count_rows("tool_calls") == 1
-
-
-def test_permission_decisions(client: TestClient) -> None:
-    approve = client.post("/permissions/demo-1/approve")
-    reject = client.post("/permissions/demo-2/reject")
-
-    assert approve.status_code == 200
-    assert approve.json() == {"permission_id": "demo-1", "status": "approved"}
-    assert reject.status_code == 200
-    assert reject.json() == {"permission_id": "demo-2", "status": "rejected"}
-
-
-def test_websocket_event_stream(client: TestClient) -> None:
+def test_chat_persists_trace_tables_from_run_events(client: TestClient) -> None:
     with client.websocket_connect("/ws/events") as websocket:
-        ready_event = websocket.receive_json()
-        assert ready_event["type"] == "event_stream.connected"
+        assert websocket.receive_json()["type"] == "event_stream_connected"
 
         response = client.post("/chat", json={"message": "open notepad"})
         assert response.status_code == 200
 
-        event_types = [websocket.receive_json()["type"] for _ in range(5)]
+        event_types = [websocket.receive_json()["type"] for _ in range(7)]
         assert event_types == [
-            "chat.message.received",
-            "plan.created",
-            "tool.started",
-            "tool.finished",
-            "assistant.message.created",
+            "user_message_received",
+            "assistant_thinking_started",
+            "plan_created",
+            "tool_selected",
+            "tool_started",
+            "tool_result",
+            "assistant_message_created",
         ]
+
+    database = client.app.state.database
+    assert database.count_rows("sessions") == 1
+    assert database.count_rows("messages") == 2
+    assert database.count_rows("events") >= 7
+    assert database.count_rows("tool_calls") == 1
+
+
+def test_permission_decisions_emit_events(client: TestClient) -> None:
+    with client.websocket_connect("/ws/events") as websocket:
+        assert websocket.receive_json()["type"] == "event_stream_connected"
+
+        approve = client.post("/permissions/demo-1/approve")
+        reject = client.post("/permissions/demo-2/reject")
+
+        assert approve.status_code == 200
+        assert approve.json() == {"permission_id": "demo-1", "status": "approved"}
+        assert reject.status_code == 200
+        assert reject.json() == {"permission_id": "demo-2", "status": "rejected"}
+        assert websocket.receive_json()["type"] == "permission_approved"
+        assert websocket.receive_json()["type"] == "permission_rejected"

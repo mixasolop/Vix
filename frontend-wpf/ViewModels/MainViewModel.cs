@@ -12,26 +12,34 @@ namespace DesktopAssistant.Frontend.ViewModels;
 
 public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
-    private static readonly Uri BackendUri = new("http://127.0.0.1:8765");
+    private static readonly Uri BackendUri = new("http://127.0.0.1:8000");
 
-    private readonly BackendClient _backendClient = new(BackendUri);
+    private readonly BackendHttpClient _backendHttpClient = new(BackendUri);
+    private readonly BackendWebSocketClient _backendWebSocketClient = new(BackendUri);
     private readonly BackendProcessManager _backendProcessManager = new();
     private readonly CancellationTokenSource _shutdown = new();
+    private readonly TaskCompletionSource<bool> _eventStreamReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private string? _conversationId;
+    private string? _currentPermissionId;
     private string _backendStatus = "Disconnected";
     private string _backendStatusDetail = "Backend has not been checked yet.";
     private string _draftInput = string.Empty;
     private string _goalTitle = "No active plan";
     private string _toolTracePlaceholder = "No tool calls yet";
     private bool _isBusy;
+    private bool _isReady;
     private bool _hasReceivedEvent;
 
     public MainViewModel()
     {
         SendCommand = new AsyncRelayCommand(SendAsync, CanSend);
+        ApprovePermissionCommand = new AsyncRelayCommand(ApprovePermissionAsync, HasPendingPermission);
+        RejectPermissionCommand = new AsyncRelayCommand(RejectPermissionAsync, HasPendingPermission);
 
         PermissionItems.Add("No pending permissions");
-        RegisteredTools.Add("Backend not connected");
+        ImplementedTools.Add("Backend not connected");
+        PlannedTools.Add("Backend not connected");
+        DisabledTools.Add("Backend not connected");
         EventLogEntries.Add("No events received");
         FailedActions.Add("No failed actions");
         FutureProposedTools.Add("window_focus");
@@ -45,6 +53,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public AsyncRelayCommand SendCommand { get; }
+
+    public AsyncRelayCommand ApprovePermissionCommand { get; }
+
+    public AsyncRelayCommand RejectPermissionCommand { get; }
 
     public string DraftInput
     {
@@ -90,7 +102,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public ObservableCollection<string> PermissionItems { get; } = [];
 
-    public ObservableCollection<string> RegisteredTools { get; } = [];
+    public ObservableCollection<string> ImplementedTools { get; } = [];
+
+    public ObservableCollection<string> PlannedTools { get; } = [];
+
+    public ObservableCollection<string> DisabledTools { get; } = [];
 
     public ObservableCollection<string> EventLogEntries { get; } = [];
 
@@ -106,19 +122,26 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
         try
         {
-            if (!await _backendClient.IsHealthyAsync(_shutdown.Token))
+            if (!await _backendHttpClient.IsHealthyAsync(_shutdown.Token))
             {
                 var backendDirectory = _backendProcessManager.LocateBackendDirectory();
                 _backendProcessManager.StartBackend(backendDirectory);
                 await WaitForBackendAsync(_shutdown.Token);
             }
 
-            SetBackendStatus("Connected", "Backend is available at http://127.0.0.1:8765.");
-            await LoadRegisteredToolsAsync(_shutdown.Token);
             _ = Task.Run(() => ListenForBackendEventsAsync(_shutdown.Token));
+            SetBackendStatus("Connecting", "Opening WebSocket event stream.");
+            await _eventStreamReady.Task.WaitAsync(TimeSpan.FromSeconds(5), _shutdown.Token);
+
+            SetBackendStatus("Connected", "Backend is available at http://127.0.0.1:8000.");
+            await LoadRegisteredToolsAsync(_shutdown.Token);
+            _isReady = true;
+            SendCommand.RaiseCanExecuteChanged();
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            _isReady = false;
+            SendCommand.RaiseCanExecuteChanged();
             SetBackendStatus("Error", ex.Message);
             ReplaceWithSingle(FailedActions, $"Backend startup failed: {ex.Message}");
         }
@@ -128,7 +151,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         _shutdown.Cancel();
         _shutdown.Dispose();
-        _backendClient.Dispose();
+        _backendHttpClient.Dispose();
         _backendProcessManager.Dispose();
     }
 
@@ -140,23 +163,27 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
-        ChatMessages.Add(new ChatMessage { Speaker = "You:", Text = message });
         DraftInput = string.Empty;
         IsBusy = true;
 
         try
         {
-            if (!await _backendClient.IsHealthyAsync(_shutdown.Token))
+            if (!_isReady)
+            {
+                ChatMessages.Add(new ChatMessage { Speaker = "Assistant:", Text = "Backend event stream is not ready yet." });
+                return;
+            }
+
+            if (!await _backendHttpClient.IsHealthyAsync(_shutdown.Token))
             {
                 SetBackendStatus("Disconnected", "Backend health check failed before sending.");
                 ChatMessages.Add(new ChatMessage { Speaker = "Assistant:", Text = "Backend is not available yet." });
                 return;
             }
 
-            var response = await _backendClient.SendChatAsync(message, _conversationId, _shutdown.Token);
-            _conversationId = response.ConversationId;
-            ApplyChatResponse(response);
-            SetBackendStatus("Connected", "Last chat request completed.");
+            var accepted = await _backendHttpClient.StartChatAsync(message, _conversationId, _shutdown.Token);
+            _conversationId = accepted.ConversationId;
+            SetBackendStatus("Connected", $"Run accepted: {accepted.RunId}");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -172,19 +199,48 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private bool CanSend()
     {
-        return !IsBusy && !string.IsNullOrWhiteSpace(DraftInput);
+        return _isReady && !IsBusy && !string.IsNullOrWhiteSpace(DraftInput);
     }
 
-    private void ApplyChatResponse(ChatResponseDto response)
+    private async Task ApprovePermissionAsync()
     {
-        ChatMessages.Add(new ChatMessage { Speaker = "Assistant:", Text = response.AssistantMessage });
+        if (_currentPermissionId is null)
+        {
+            return;
+        }
 
-        GoalTitle = string.IsNullOrWhiteSpace(response.Plan.Goal)
+        await _backendHttpClient.ApprovePermissionAsync(_currentPermissionId, _shutdown.Token);
+        _currentPermissionId = null;
+        ApprovePermissionCommand.RaiseCanExecuteChanged();
+        RejectPermissionCommand.RaiseCanExecuteChanged();
+    }
+
+    private async Task RejectPermissionAsync()
+    {
+        if (_currentPermissionId is null)
+        {
+            return;
+        }
+
+        await _backendHttpClient.RejectPermissionAsync(_currentPermissionId, _shutdown.Token);
+        _currentPermissionId = null;
+        ApprovePermissionCommand.RaiseCanExecuteChanged();
+        RejectPermissionCommand.RaiseCanExecuteChanged();
+    }
+
+    private bool HasPendingPermission()
+    {
+        return !string.IsNullOrWhiteSpace(_currentPermissionId);
+    }
+
+    private void ApplyPlan(PlanDto plan)
+    {
+        GoalTitle = string.IsNullOrWhiteSpace(plan.Goal)
             ? "No active plan"
-            : $"Goal: {response.Plan.Goal}";
+            : $"Goal: {plan.Goal}";
 
         PlanSteps.Clear();
-        foreach (var step in response.Plan.Steps.OrderBy(step => step.Number))
+        foreach (var step in plan.Steps.OrderBy(step => step.Number))
         {
             PlanSteps.Add(new PlanStep
             {
@@ -193,45 +249,118 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             });
         }
 
-        ToolTraces.Clear();
-        foreach (var call in response.ToolCalls)
-        {
-            ToolTraces.Add(new ToolTraceEntry
-            {
-                Tool = $"Tool: {call.Tool}",
-                Arguments = $"Args: {FormatObjectMap(call.Arguments)}",
-                Status = $"Status: {call.Status}",
-            });
-        }
+    }
 
-        ToolTracePlaceholder = ToolTraces.Count == 0 ? "No tool calls yet" : string.Empty;
+    private void AddToolTrace(string toolName, Dictionary<string, object?> arguments, string status)
+    {
+        ToolTraces.Add(new ToolTraceEntry
+        {
+            Tool = $"Tool: {toolName}",
+            Arguments = $"Args: {FormatObjectMap(arguments)}",
+            Status = $"Status: {status}",
+        });
+        ToolTracePlaceholder = string.Empty;
+    }
 
-        PermissionItems.Clear();
-        if (response.Permissions.Count == 0)
+    private void ApplyAssistantEvent(AssistantEventDto assistantEvent)
+    {
+        switch (assistantEvent.Type)
         {
-            PermissionItems.Add("No pending permissions");
-        }
-        else
-        {
-            foreach (var permission in response.Permissions)
-            {
-                PermissionItems.Add($"{permission.PermissionId}: {permission.Tool} - {permission.Reason}");
-            }
+            case "user_message_received":
+                ChatMessages.Add(new ChatMessage
+                {
+                    Speaker = "You:",
+                    Text = GetString(assistantEvent.Data, "message"),
+                });
+                break;
+
+            case "assistant_message_created":
+                ChatMessages.Add(new ChatMessage
+                {
+                    Speaker = "Assistant:",
+                    Text = GetString(assistantEvent.Data, "message"),
+                });
+                IsBusy = false;
+                break;
+
+            case "plan_created":
+                ApplyPlanIfPresent(assistantEvent.Data);
+                break;
+
+            case "tool_selected":
+                ApplyPlanIfPresent(assistantEvent.Data);
+                AddToolTrace(GetString(assistantEvent.Data, "tool_name"), GetObjectMap(assistantEvent.Data, "arguments"), "selected");
+                break;
+
+            case "tool_started":
+                ApplyPlanIfPresent(assistantEvent.Data);
+                AddToolTrace(GetString(assistantEvent.Data, "tool_name"), GetObjectMap(assistantEvent.Data, "arguments"), "running");
+                break;
+
+            case "tool_result":
+                ApplyPlanIfPresent(assistantEvent.Data);
+                AddToolTrace(
+                    GetString(assistantEvent.Data, "tool_name"),
+                    GetObjectMap(assistantEvent.Data, "arguments"),
+                    GetString(assistantEvent.Data, "status"));
+                break;
+
+            case "permission_required":
+                _currentPermissionId = GetString(assistantEvent.Data, "permission_id");
+                PermissionItems.Clear();
+                PermissionItems.Add(FormatPermission(assistantEvent.Data));
+                ApprovePermissionCommand.RaiseCanExecuteChanged();
+                RejectPermissionCommand.RaiseCanExecuteChanged();
+                break;
+
+            case "permission_approved":
+            case "permission_rejected":
+                PermissionItems.Clear();
+                PermissionItems.Add(assistantEvent.Type == "permission_approved" ? "Permission approved" : "Permission rejected");
+                _currentPermissionId = null;
+                ApprovePermissionCommand.RaiseCanExecuteChanged();
+                RejectPermissionCommand.RaiseCanExecuteChanged();
+                break;
+
+            case "error_occurred":
+                FailedActions.Insert(0, GetString(assistantEvent.Data, "message"));
+                break;
         }
     }
 
     private async Task LoadRegisteredToolsAsync(CancellationToken cancellationToken)
     {
-        var tools = await _backendClient.GetToolsAsync(cancellationToken);
-        RegisteredTools.Clear();
+        var tools = await _backendHttpClient.GetToolsAsync(cancellationToken);
+        ImplementedTools.Clear();
+        PlannedTools.Clear();
+        DisabledTools.Clear();
         foreach (var tool in tools)
         {
-            RegisteredTools.Add(string.IsNullOrWhiteSpace(tool.Status) ? tool.Name : $"{tool.Name} [{tool.Status}]");
+            switch (tool.Status)
+            {
+                case "implemented":
+                    ImplementedTools.Add(tool.Name);
+                    break;
+                case "disabled":
+                    DisabledTools.Add(tool.Name);
+                    break;
+                default:
+                    PlannedTools.Add(tool.Name);
+                    break;
+            }
         }
 
-        if (RegisteredTools.Count == 0)
+        if (ImplementedTools.Count == 0)
         {
-            RegisteredTools.Add("No tools registered");
+            ImplementedTools.Add("No implemented tools");
+        }
+        if (PlannedTools.Count == 0)
+        {
+            PlannedTools.Add("No planned tools");
+        }
+        if (DisabledTools.Count == 0)
+        {
+            DisabledTools.Add("No disabled tools");
         }
     }
 
@@ -239,7 +368,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            await _backendClient.ListenForEventsAsync(
+            await _backendWebSocketClient.ListenForEventsAsync(
                 assistantEvent => Application.Current.Dispatcher.InvokeAsync(() =>
                 {
                     if (!_hasReceivedEvent)
@@ -249,6 +378,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                     }
 
                     EventLogEntries.Insert(0, FormatEventJson(assistantEvent));
+                    if (assistantEvent.Type == "event_stream_connected")
+                    {
+                        _eventStreamReady.TrySetResult(true);
+                    }
+                    ApplyAssistantEvent(assistantEvent);
                     return Task.CompletedTask;
                 }).Task.Unwrap(),
                 cancellationToken);
@@ -267,7 +401,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         for (var attempt = 0; attempt < 30; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (await _backendClient.IsHealthyAsync(cancellationToken))
+            if (await _backendHttpClient.IsHealthyAsync(cancellationToken))
             {
                 return;
             }
@@ -312,6 +446,74 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         collection.Clear();
         collection.Add(value);
+    }
+
+    private void ApplyPlanIfPresent(Dictionary<string, object?> data)
+    {
+        if (!data.TryGetValue("plan", out var value))
+        {
+            return;
+        }
+
+        var plan = DeserializeValue<PlanDto>(value);
+        if (plan is not null)
+        {
+            ApplyPlan(plan);
+        }
+    }
+
+    private static T? DeserializeValue<T>(object? value)
+    {
+        return value switch
+        {
+            JsonElement element => element.Deserialize<T>(),
+            T typed => typed,
+            _ => default,
+        };
+    }
+
+    private static string GetString(Dictionary<string, object?> data, string key)
+    {
+        if (!data.TryGetValue(key, out var value) || value is null)
+        {
+            return string.Empty;
+        }
+
+        return value switch
+        {
+            JsonElement element when element.ValueKind == JsonValueKind.String => element.GetString() ?? string.Empty,
+            JsonElement element => element.ToString(),
+            _ => value.ToString() ?? string.Empty,
+        };
+    }
+
+    private static Dictionary<string, object?> GetObjectMap(Dictionary<string, object?> data, string key)
+    {
+        if (!data.TryGetValue(key, out var value) || value is null)
+        {
+            return [];
+        }
+
+        if (value is Dictionary<string, object?> dictionary)
+        {
+            return dictionary;
+        }
+
+        if (value is JsonElement element && element.ValueKind == JsonValueKind.Object)
+        {
+            return element.EnumerateObject().ToDictionary(property => property.Name, property => (object?)property.Value.Clone());
+        }
+
+        return [];
+    }
+
+    private static string FormatPermission(Dictionary<string, object?> data)
+    {
+        var permissionId = GetString(data, "permission_id");
+        var preview = GetObjectMap(data, "preview");
+        var actionType = GetString(data, "action_type");
+        var reason = preview.TryGetValue("reason", out var reasonValue) ? FormatObject(reasonValue) : "Permission required";
+        return $"{permissionId}: {actionType} - {reason}";
     }
 
     private static string FormatObjectMap(Dictionary<string, object?> values)

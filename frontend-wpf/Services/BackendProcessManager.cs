@@ -39,13 +39,14 @@ public sealed class BackendProcessManager : IDisposable
         var startInfo = new ProcessStartInfo
         {
             FileName = python.FileName,
-            Arguments = $"{python.PrefixArguments} -m uvicorn app.main:app --host 127.0.0.1 --port 8765".Trim(),
+            Arguments = $"{python.PrefixArguments} -m uvicorn app.main:app --host 127.0.0.1 --port 8000".Trim(),
             WorkingDirectory = backendDirectory.FullName,
             UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            CreateNoWindow = false,
+            RedirectStandardOutput = false,
+            RedirectStandardError = false,
         };
+        startInfo.Environment["PYTHONUNBUFFERED"] = "1";
 
         _process = Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to start backend process.");
         return _process;

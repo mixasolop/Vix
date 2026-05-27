@@ -16,8 +16,8 @@ class Planner:
             goal=goal,
             steps=[
                 PlanStep(number=1, title="Understand request", status=PlanStepStatus.completed),
-                PlanStep(number=2, title="Select tool", status=PlanStepStatus.completed),
-                PlanStep(number=3, title="Execute", status=PlanStepStatus.completed),
+                PlanStep(number=2, title="Select tool", status=PlanStepStatus.pending),
+                PlanStep(number=3, title="Execute", status=PlanStepStatus.pending),
             ],
         )
 

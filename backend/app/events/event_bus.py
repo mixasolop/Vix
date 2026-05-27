@@ -1,8 +1,11 @@
 import asyncio
+import logging
 
 from fastapi import WebSocket
 
 from app.schemas.events import AssistantEvent
+
+LOGGER = logging.getLogger("app.events")
 
 
 class EventBus:
@@ -13,10 +16,14 @@ class EventBus:
     async def subscribe(self, websocket: WebSocket) -> None:
         async with self._lock:
             self._subscribers.add(websocket)
+            subscriber_count = len(self._subscribers)
+        LOGGER.info("websocket subscribed | subscribers=%s", subscriber_count)
 
     async def unsubscribe(self, websocket: WebSocket) -> None:
         async with self._lock:
             self._subscribers.discard(websocket)
+            subscriber_count = len(self._subscribers)
+        LOGGER.info("websocket unsubscribed | subscribers=%s", subscriber_count)
 
     async def publish(self, event: AssistantEvent) -> None:
         async with self._lock:
@@ -24,6 +31,7 @@ class EventBus:
 
         stale_subscribers: list[WebSocket] = []
         payload = event.model_dump(mode="json")
+        LOGGER.info("websocket publish | type=%s | subscribers=%s", event.type, len(subscribers))
         for websocket in subscribers:
             try:
                 await websocket.send_json(payload)
@@ -34,3 +42,5 @@ class EventBus:
             async with self._lock:
                 for websocket in stale_subscribers:
                     self._subscribers.discard(websocket)
+                subscriber_count = len(self._subscribers)
+            LOGGER.info("removed stale websocket subscribers | subscribers=%s", subscriber_count)

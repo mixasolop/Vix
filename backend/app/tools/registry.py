@@ -1,11 +1,14 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+import json
+import logging
 from typing import Any
 
 from app.schemas.tools import ConfirmationPolicy, RetryPolicy, RiskLevel, ToolDefinition, ToolResult, ToolStatus
 from app.tools.system_tools import launch_app
 
+LOGGER = logging.getLogger("app.tools.registry")
 ToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
 
 
@@ -21,6 +24,12 @@ class ToolRegistry:
 
     def register(self, metadata: ToolDefinition, executor: ToolExecutor | None = None) -> None:
         self._tools[metadata.name] = ToolRuntimeDefinition(metadata=metadata, executor=executor)
+        LOGGER.info(
+            "tool registered | name=%s | status=%s | executable=%s",
+            metadata.name,
+            metadata.status.value,
+            executor is not None,
+        )
 
     def get(self, name: str) -> ToolDefinition | None:
         runtime = self._tools.get(name)
@@ -33,32 +42,56 @@ class ToolRegistry:
         return [runtime.metadata for runtime in self._tools.values()]
 
     async def execute(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        LOGGER.info("tool execution requested | name=%s | arguments=%s", name, _json_for_log(arguments))
         runtime = self._tools.get(name)
         if runtime is None:
+            LOGGER.warning("tool execution rejected | name=%s | reason=unknown_tool", name)
             return ToolResult(tool=name, status="failed", error=f"Unknown tool: {name}")
 
         metadata = runtime.metadata
         if metadata.status != ToolStatus.implemented or runtime.executor is None:
+            LOGGER.warning(
+                "tool execution rejected | name=%s | status=%s | executable=%s",
+                name,
+                metadata.status.value,
+                runtime.executor is not None,
+            )
             return ToolResult(tool=name, status="failed", error=f"Tool is not implemented: {name}")
 
         validation_error = self._validate_required_arguments(metadata, arguments)
         if validation_error is not None:
+            LOGGER.warning("tool validation failed | name=%s | error=%s", name, validation_error)
             return ToolResult(tool=name, status="failed", error=validation_error)
 
         last_result: ToolResult | None = None
-        for _ in range(metadata.retry_policy.max_attempts):
+        for attempt in range(1, metadata.retry_policy.max_attempts + 1):
             try:
-                return await asyncio.wait_for(runtime.executor(arguments), timeout=metadata.timeout_seconds)
+                LOGGER.info("tool attempt started | name=%s | attempt=%s/%s", name, attempt, metadata.retry_policy.max_attempts)
+                result = await asyncio.wait_for(runtime.executor(arguments), timeout=metadata.timeout_seconds)
+                if result.status == "success":
+                    LOGGER.info("tool attempt succeeded | name=%s | attempt=%s | output=%s", name, attempt, _json_for_log(result.output))
+                else:
+                    LOGGER.warning("tool attempt failed | name=%s | attempt=%s | error=%s", name, attempt, result.error)
+                return result
             except TimeoutError:
                 last_result = ToolResult(tool=name, status="failed", error=f"Tool timed out after {metadata.timeout_seconds} seconds.")
+                LOGGER.warning("tool attempt timed out | name=%s | attempt=%s | timeout_seconds=%s", name, attempt, metadata.timeout_seconds)
 
             if metadata.retry_policy.backoff_seconds > 0:
                 await asyncio.sleep(metadata.retry_policy.backoff_seconds)
 
+        LOGGER.warning("tool execution exhausted retries | name=%s", name)
         return last_result or ToolResult(tool=name, status="failed", error="Tool execution failed.")
 
     @staticmethod
     def _validate_required_arguments(metadata: ToolDefinition, arguments: dict[str, object]) -> str | None:
+        if metadata.input_schema.get("additionalProperties") is False:
+            allowed = metadata.input_schema.get("properties", {})
+            if isinstance(allowed, dict):
+                extra = sorted(set(arguments) - set(allowed))
+                if extra:
+                    return f"Unexpected argument(s): {', '.join(extra)}"
+
         required = metadata.input_schema.get("required", [])
         if not isinstance(required, list):
             return None
@@ -66,6 +99,20 @@ class ToolRegistry:
         missing = [field for field in required if isinstance(field, str) and field not in arguments]
         if missing:
             return f"Missing required argument(s): {', '.join(missing)}"
+
+        properties = metadata.input_schema.get("properties", {})
+        if isinstance(properties, dict):
+            for name, schema in properties.items():
+                if name not in arguments or not isinstance(schema, dict):
+                    continue
+                expected_type = schema.get("type")
+                value = arguments[name]
+                if expected_type == "string" and not isinstance(value, str):
+                    return f"Argument '{name}' must be a string."
+                if expected_type == "object" and not isinstance(value, dict):
+                    return f"Argument '{name}' must be an object."
+                if expected_type == "array" and not isinstance(value, list):
+                    return f"Argument '{name}' must be an array."
         return None
 
 
@@ -238,3 +285,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
             None,
         ),
     ]
+
+
+def _json_for_log(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
