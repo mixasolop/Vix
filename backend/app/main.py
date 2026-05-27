@@ -11,19 +11,23 @@ from app.assistant.orchestrator import Orchestrator
 from app.assistant.policy import PermissionManager
 from app.config import load_config
 from app.db.database import Database
+from app.events.event_bus import EventBus
 from app.tools.registry import build_default_registry
+from app.tools.registry import ToolRegistry
 from app.ws.event_stream import router as event_stream_router
 
 
-def create_app(database_path: str | Path | None = None) -> FastAPI:
+def create_app(database_path: str | Path | None = None, registry: ToolRegistry | None = None) -> FastAPI:
     config = load_config()
     database = Database(database_path or config.database_path)
-    registry = build_default_registry()
-    permission_manager = PermissionManager()
+    event_bus = EventBus()
+    registry = registry or build_default_registry()
+    permission_manager = PermissionManager(database)
     orchestrator = Orchestrator(
         registry=registry,
         database=database,
         permission_manager=permission_manager,
+        event_bus=event_bus,
     )
 
     @asynccontextmanager
@@ -40,6 +44,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     )
     app.state.config = config
     app.state.database = database
+    app.state.event_bus = event_bus
     app.state.registry = registry
     app.state.permission_manager = permission_manager
     app.state.orchestrator = orchestrator

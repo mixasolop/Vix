@@ -72,16 +72,16 @@ public sealed class BackendClient : IDisposable
         return chatResponse ?? throw new InvalidOperationException("Backend returned an empty chat response.");
     }
 
-    public async Task<IReadOnlyList<string>> GetToolNamesAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ToolDefinitionDto>> GetToolsAsync(CancellationToken cancellationToken)
     {
         using var response = await _httpClient.GetAsync("/tools", cancellationToken);
         response.EnsureSuccessStatusCode();
 
         var toolsResponse = await response.Content.ReadFromJsonAsync<ToolListResponseDto>(JsonOptions, cancellationToken);
-        return toolsResponse?.Tools.Select(tool => tool.Name).Where(name => !string.IsNullOrWhiteSpace(name)).ToList() ?? [];
+        return toolsResponse?.Tools ?? [];
     }
 
-    public async Task ListenForEventsAsync(Func<string, Task> onEventType, CancellationToken cancellationToken)
+    public async Task ListenForEventsAsync(Func<AssistantEventDto, Task> onEvent, CancellationToken cancellationToken)
     {
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(EventsUri, cancellationToken);
@@ -106,7 +106,7 @@ public sealed class BackendClient : IDisposable
             var eventDto = JsonSerializer.Deserialize<AssistantEventDto>(message.ToString(), JsonOptions);
             if (!string.IsNullOrWhiteSpace(eventDto?.Type))
             {
-                await onEventType(eventDto.Type);
+                await onEvent(eventDto);
             }
         }
     }

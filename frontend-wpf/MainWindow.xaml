@@ -114,9 +114,16 @@
                                         Style="{StaticResource ActionButtonStyle}" />
                             </Grid>
 
-                            <StackPanel>
-                                <TextBlock Text="Chat" Style="{StaticResource PanelTitleStyle}" />
-                                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Text="Chat" Style="{StaticResource PanelTitleStyle}" />
+                                <ScrollViewer x:Name="ChatScrollViewer"
+                                              Grid.Row="1"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled">
                                     <ItemsControl ItemsSource="{Binding ChatMessages}">
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate>
@@ -137,7 +144,7 @@
                                         </ItemsControl.ItemTemplate>
                                     </ItemsControl>
                                 </ScrollViewer>
-                            </StackPanel>
+                            </Grid>
                         </DockPanel>
                     </Border>
 

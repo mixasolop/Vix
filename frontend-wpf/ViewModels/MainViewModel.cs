@@ -222,11 +222,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private async Task LoadRegisteredToolsAsync(CancellationToken cancellationToken)
     {
-        var toolNames = await _backendClient.GetToolNamesAsync(cancellationToken);
+        var tools = await _backendClient.GetToolsAsync(cancellationToken);
         RegisteredTools.Clear();
-        foreach (var toolName in toolNames)
+        foreach (var tool in tools)
         {
-            RegisteredTools.Add(toolName);
+            RegisteredTools.Add(string.IsNullOrWhiteSpace(tool.Status) ? tool.Name : $"{tool.Name} [{tool.Status}]");
         }
 
         if (RegisteredTools.Count == 0)
@@ -240,7 +240,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         try
         {
             await _backendClient.ListenForEventsAsync(
-                eventType => Application.Current.Dispatcher.InvokeAsync(() =>
+                assistantEvent => Application.Current.Dispatcher.InvokeAsync(() =>
                 {
                     if (!_hasReceivedEvent)
                     {
@@ -248,7 +248,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                         _hasReceivedEvent = true;
                     }
 
-                    EventLogEntries.Insert(0, eventType);
+                    EventLogEntries.Insert(0, FormatEventJson(assistantEvent));
                     return Task.CompletedTask;
                 }).Task.Unwrap(),
                 cancellationToken);
@@ -332,6 +332,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             JsonElement element => element.ValueKind == JsonValueKind.String ? element.GetString() ?? string.Empty : element.ToString(),
             _ => value.ToString() ?? string.Empty,
         };
+    }
+
+    private static string FormatEventJson(AssistantEventDto assistantEvent)
+    {
+        return JsonSerializer.Serialize(assistantEvent, new JsonSerializerOptions { WriteIndented = false });
     }
 
     private bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
