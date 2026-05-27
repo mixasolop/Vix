@@ -1,0 +1,19 @@
+# .NET
+bin/
+obj/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Local runtime data
+*.sqlite3
+*.db
+
+# Editors
+.vs/
+.vscode/
