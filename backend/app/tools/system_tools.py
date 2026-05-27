@@ -1,5 +1,6 @@
 import logging
 import subprocess
+from datetime import datetime
 
 from app.schemas.tools import ToolResult
 
@@ -53,5 +54,21 @@ async def launch_app(arguments: dict[str, object]) -> ToolResult:
             "status": "success",
             "message": f"Launched {command}.",
             "pid": process.pid,
+        },
+    )
+
+
+async def get_current_time(arguments: dict[str, object]) -> ToolResult:
+    now = datetime.now().astimezone()
+    timezone = now.tzname() or "local time"
+    readable_time = now.strftime("%Y-%m-%d %H:%M:%S")
+    return ToolResult(
+        tool="get_current_time",
+        status="success",
+        output={
+            "status": "success",
+            "message": f"Current time is {readable_time} {timezone}.",
+            "iso_time": now.isoformat(),
+            "timezone": timezone,
         },
     )

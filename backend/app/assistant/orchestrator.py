@@ -3,14 +3,15 @@ import json
 import logging
 from uuid import uuid4
 
-from app.assistant.planner import Planner
-from app.assistant.policy import PendingAction, PermissionManager
+from app.assistant.llm_client import DeterministicLLMClient, LLMClient
+from app.assistant.planner import FALLBACK_MESSAGE, Planner
+from app.assistant.policy import PendingAction, PermissionManager, PolicyEngine
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.schemas.chat import ChatAcceptedResponse, ChatRequest
 from app.schemas.events import AssistantEvent
 from app.schemas.plans import Plan, PlanStep, PlanStepStatus
-from app.schemas.tools import ConfirmationPolicy, PermissionDecisionResponse, PermissionRequest, ToolCall
+from app.schemas.tools import PermissionDecisionResponse, PermissionPreview, PermissionRequest, ToolCall, ToolDefinition
 from app.tools.registry import ToolRegistry
 
 LOGGER = logging.getLogger("app.orchestrator")
@@ -24,12 +25,16 @@ class Orchestrator:
         permission_manager: PermissionManager,
         event_bus: EventBus,
         planner: Planner | None = None,
+        policy_engine: PolicyEngine | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._registry = registry
         self._database = database
         self._permission_manager = permission_manager
         self._event_bus = event_bus
         self._planner = planner or Planner()
+        self._policy_engine = policy_engine or PolicyEngine()
+        self._llm_client = llm_client or DeterministicLLMClient()
         self._active_tasks: set[asyncio.Task[None]] = set()
 
     async def start_chat(self, request: ChatRequest) -> ChatAcceptedResponse:
@@ -111,13 +116,26 @@ class Orchestrator:
             proposal = self._planner.propose_tool_call(normalized_message)
             if proposal is None:
                 LOGGER.info("planner produced no tool call | session=%s | run=%s", session_id, run_id)
-                await self._finish_without_tool(session_id, run_id, "I could not map that request to an implemented Stage 1 tool yet.")
+                assistant_message = await self._llm_client.complete([{"role": "user", "content": normalized_message}])
+                await self._finish_without_tool(session_id, run_id, assistant_message or FALLBACK_MESSAGE)
                 return
 
             metadata = self._registry.get(proposal.name)
             if metadata is None:
                 LOGGER.error("planner selected unregistered tool | tool=%s | session=%s | run=%s", proposal.name, session_id, run_id)
                 await self._fail_run(session_id, run_id, f"Tool is not registered: {proposal.name}.")
+                return
+
+            policy_decision = self._policy_engine.evaluate_tool_call(metadata, proposal.arguments)
+            if policy_decision.blocked:
+                LOGGER.warning(
+                    "policy blocked tool call | tool=%s | session=%s | run=%s | reason=%s",
+                    proposal.name,
+                    session_id,
+                    run_id,
+                    policy_decision.reason,
+                )
+                await self._fail_run(session_id, run_id, policy_decision.reason)
                 return
 
             selected_plan = self._plan_with_statuses(plan, select_status=PlanStepStatus.completed, execute_status=PlanStepStatus.pending)
@@ -130,11 +148,17 @@ class Orchestrator:
                     "arguments": proposal.arguments,
                     "risk_level": metadata.risk_level.value,
                     "confirmation_policy": metadata.confirmation_policy.value,
+                    "policy_decision": {
+                        "allowed": policy_decision.allowed,
+                        "requires_permission": policy_decision.requires_permission,
+                        "blocked": policy_decision.blocked,
+                        "reason": policy_decision.reason,
+                    },
                     "plan": selected_plan.model_dump(mode="json"),
                 },
             )
 
-            if metadata.confirmation_policy != ConfirmationPolicy.none:
+            if policy_decision.requires_permission:
                 permission_id = str(uuid4())
                 LOGGER.info(
                     "permission required | permission=%s | tool=%s | session=%s | run=%s",
@@ -146,15 +170,15 @@ class Orchestrator:
                 permission = PermissionRequest(
                     permission_id=permission_id,
                     tool=proposal.name,
-                    reason=f"{proposal.name} requires confirmation before execution.",
+                    reason=policy_decision.reason,
                     arguments=proposal.arguments,
                 )
-                preview = {
-                    "permission_id": permission_id,
-                    "tool_name": proposal.name,
-                    "arguments": proposal.arguments,
-                    "reason": permission.reason,
-                }
+                preview = self._build_permission_preview(
+                    permission_id=permission_id,
+                    tool=metadata,
+                    arguments=proposal.arguments,
+                    reason=permission.reason,
+                ).model_dump(mode="json")
                 self._database.create_permission(
                     permission_id=permission_id,
                     session_id=session_id,
@@ -181,6 +205,17 @@ class Orchestrator:
                         "permission": permission.model_dump(mode="json"),
                     },
                 )
+                return
+
+            if not policy_decision.allowed:
+                LOGGER.error(
+                    "policy returned non-executable decision | tool=%s | session=%s | run=%s | reason=%s",
+                    proposal.name,
+                    session_id,
+                    run_id,
+                    policy_decision.reason,
+                )
+                await self._fail_run(session_id, run_id, policy_decision.reason)
                 return
 
             await self._execute_tool(session_id, run_id, proposal.name, proposal.arguments, selected_plan)
@@ -306,6 +341,28 @@ class Orchestrator:
             return str(message) if message else f"{tool_call.tool} completed."
         return tool_call.error or f"{tool_call.tool} failed."
 
+    @staticmethod
+    def _build_permission_preview(
+        permission_id: str,
+        tool: ToolDefinition,
+        arguments: dict[str, object],
+        reason: str,
+    ) -> PermissionPreview:
+        target = _preview_target(tool.name, arguments)
+        return PermissionPreview(
+            permission_id=permission_id,
+            tool_name=tool.name,
+            action=f"Run {tool.name}",
+            target=target,
+            content=dict(arguments),
+            risk_level=tool.risk_level,
+            what_will_happen=_preview_what_will_happen(tool.name, target),
+            reason=reason,
+            editable=False,
+            edit_schema=tool.input_schema,
+            arguments=dict(arguments),
+        )
+
 
 def _json_for_log(data: dict[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
@@ -316,3 +373,27 @@ def _short_text(value: str, limit: int = 300) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[:limit]}..."
+
+
+def _preview_target(tool_name: str, arguments: dict[str, object]) -> str:
+    if tool_name == "launch_app":
+        return str(arguments.get("app_name", "")).strip() or "Unknown application"
+    if tool_name == "send_message":
+        return str(arguments.get("recipient", "")).strip() or "Unknown recipient"
+    if tool_name == "pay_for_order":
+        return str(arguments.get("order_id", "")).strip() or "Unknown order"
+    if "path" in arguments:
+        return str(arguments["path"])
+    if "url" in arguments:
+        return str(arguments["url"])
+    return tool_name
+
+
+def _preview_what_will_happen(tool_name: str, target: str) -> str:
+    if tool_name == "launch_app":
+        return f"The assistant will launch the whitelisted Windows application '{target}'."
+    if tool_name == "send_message":
+        return f"The assistant will send the shown message to '{target}' after approval."
+    if tool_name == "pay_for_order":
+        return f"The assistant will submit payment for order '{target}' after approval."
+    return f"The assistant will run '{tool_name}' with the shown content."

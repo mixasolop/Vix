@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from app.schemas.tools import ConfirmationPolicy, RetryPolicy, RiskLevel, ToolDefinition, ToolResult, ToolStatus
-from app.tools.system_tools import launch_app
+from app.tools.system_tools import get_current_time, launch_app
 
 LOGGER = logging.getLogger("app.tools.registry")
 ToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
@@ -120,6 +120,7 @@ def build_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     for definition, executor in _default_tool_runtimes():
         registry.register(definition, executor)
+    registry.register(_list_available_tools_definition(), _build_list_available_tools_executor(registry))
     return registry
 
 
@@ -142,6 +143,69 @@ def _success_output_schema() -> dict[str, Any]:
     )
 
 
+def _list_available_tools_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "tools": {"type": "array", "items": {"type": "object"}},
+        },
+        ["status", "message", "tools"],
+    )
+
+
+def _time_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "iso_time": {"type": "string"},
+            "timezone": {"type": "string"},
+        },
+        ["status", "message", "iso_time", "timezone"],
+    )
+
+
+def _list_available_tools_definition() -> ToolDefinition:
+    return ToolDefinition(
+        name="list_available_tools",
+        description="List registered assistant tools and their Stage 1 status.",
+        status=ToolStatus.implemented,
+        input_schema=_object_schema({}),
+        output_schema=_list_available_tools_output_schema(),
+        risk_level=RiskLevel.read,
+        confirmation_policy=ConfirmationPolicy.none,
+        timeout_seconds=5,
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+
+
+def _build_list_available_tools_executor(registry: ToolRegistry) -> ToolExecutor:
+    async def list_available_tools(arguments: dict[str, object]) -> ToolResult:
+        tools = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "status": tool.status.value,
+                "risk_level": tool.risk_level.value,
+                "confirmation_policy": tool.confirmation_policy.value,
+            }
+            for tool in registry.list_tools()
+        ]
+        implemented = [tool["name"] for tool in tools if tool["status"] == ToolStatus.implemented.value]
+        return ToolResult(
+            tool="list_available_tools",
+            status="success",
+            output={
+                "status": "success",
+                "message": f"Available implemented tools: {', '.join(implemented)}.",
+                "tools": tools,
+            },
+        )
+
+    return list_available_tools
+
+
 def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]:
     return [
         (
@@ -151,7 +215,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.implemented,
                 input_schema=_object_schema({"app_name": {"type": "string"}}, ["app_name"]),
                 output_schema=_success_output_schema(),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.low_write,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=10,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -160,12 +224,26 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
         ),
         (
             ToolDefinition(
+                name="get_current_time",
+                description="Return the current local date and time.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_time_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=5,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            get_current_time,
+        ),
+        (
+            ToolDefinition(
                 name="search_files",
                 description="Search local indexed locations for files matching a user query.",
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"query": {"type": "string"}}, ["query"]),
                 output_schema=_object_schema({"matches": {"type": "array", "items": {"type": "string"}}}),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=20,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -179,9 +257,51 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"path": {"type": "string"}}, ["path"]),
                 output_schema=_success_output_schema(),
-                risk_level=RiskLevel.medium,
+                risk_level=RiskLevel.medium_write,
                 confirmation_policy=ConfirmationPolicy.before_execute,
                 timeout_seconds=10,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            None,
+        ),
+        (
+            ToolDefinition(
+                name="create_file",
+                description="Create a local file after preview and permission.",
+                status=ToolStatus.planned,
+                input_schema=_object_schema({"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+                output_schema=_success_output_schema(),
+                risk_level=RiskLevel.medium_write,
+                confirmation_policy=ConfirmationPolicy.before_execute,
+                timeout_seconds=10,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            None,
+        ),
+        (
+            ToolDefinition(
+                name="send_message",
+                description="Send a drafted message to a recipient after explicit approval.",
+                status=ToolStatus.planned,
+                input_schema=_object_schema({"recipient": {"type": "string"}, "message": {"type": "string"}}, ["recipient", "message"]),
+                output_schema=_success_output_schema(),
+                risk_level=RiskLevel.high_risk,
+                confirmation_policy=ConfirmationPolicy.before_execute,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            None,
+        ),
+        (
+            ToolDefinition(
+                name="pay_for_order",
+                description="Submit payment for a prepared order after explicit approval.",
+                status=ToolStatus.planned,
+                input_schema=_object_schema({"order_id": {"type": "string"}, "amount": {"type": "string"}}, ["order_id", "amount"]),
+                output_schema=_success_output_schema(),
+                risk_level=RiskLevel.high_risk,
+                confirmation_policy=ConfirmationPolicy.before_execute,
+                timeout_seconds=15,
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
             None,
@@ -193,7 +313,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({}),
                 output_schema=_object_schema({"image_id": {"type": "string"}}),
-                risk_level=RiskLevel.medium,
+                risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.before_execute,
                 timeout_seconds=10,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -207,7 +327,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({}),
                 output_schema=_object_schema({"tree": {"type": "object"}}),
-                risk_level=RiskLevel.medium,
+                risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.before_execute,
                 timeout_seconds=10,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -221,7 +341,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"url": {"type": "string"}}, ["url"]),
                 output_schema=_success_output_schema(),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.low_write,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=10,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -235,7 +355,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"query": {"type": "string"}}, ["query"]),
                 output_schema=_object_schema({"results": {"type": "array", "items": {"type": "object"}}}),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=30,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -249,7 +369,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"selector": {"type": "string"}, "value": {"type": "string"}}, ["selector", "value"]),
                 output_schema=_success_output_schema(),
-                risk_level=RiskLevel.high,
+                risk_level=RiskLevel.high_risk,
                 confirmation_policy=ConfirmationPolicy.before_execute,
                 timeout_seconds=15,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -263,7 +383,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"text": {"type": "string"}}, ["text"]),
                 output_schema=_success_output_schema(),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.low_write,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=20,
                 retry_policy=RetryPolicy(max_attempts=1),
@@ -277,7 +397,7 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 status=ToolStatus.planned,
                 input_schema=_object_schema({"audio_id": {"type": "string"}}, ["audio_id"]),
                 output_schema=_object_schema({"text": {"type": "string"}}, ["text"]),
-                risk_level=RiskLevel.low,
+                risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.none,
                 timeout_seconds=30,
                 retry_policy=RetryPolicy(max_attempts=1),

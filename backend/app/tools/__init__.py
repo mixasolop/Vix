@@ -1,1 +1,1 @@
-"""Tool contracts and fake Stage 1.2 tool implementations."""
+"""Tool contracts and deterministic Stage 1 tool implementations."""

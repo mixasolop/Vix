@@ -70,6 +70,18 @@
                 </StackPanel>
             </Grid>
         </DataTemplate>
+
+        <DataTemplate x:Key="ProposedToolTemplate">
+            <StackPanel Margin="0,0,0,14">
+                <TextBlock Text="{Binding}" FontWeight="SemiBold" Foreground="{StaticResource PrimaryTextBrush}" />
+                <TextBlock Text="Status: not implemented" Style="{StaticResource MutedTextStyle}" Margin="0,2,0,8" />
+                <StackPanel Orientation="Horizontal">
+                    <Button Content="Approve later" IsEnabled="False" Padding="10,5" Margin="0,0,8,0" />
+                    <Button Content="Reject" IsEnabled="False" Padding="10,5" Margin="0,0,8,0" />
+                    <Button Content="Open spec" IsEnabled="False" Padding="10,5" />
+                </StackPanel>
+            </StackPanel>
+        </DataTemplate>
     </Window.Resources>
 
     <Grid>
@@ -236,6 +248,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*" />
                         <RowDefinition Height="*" />
+                        <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
@@ -268,9 +281,9 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="Event Log" Style="{StaticResource PanelTitleStyle}" />
+                            <TextBlock Grid.Row="0" Text="Recent Tool Calls" Style="{StaticResource PanelTitleStyle}" />
                             <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
-                                <ItemsControl ItemsSource="{Binding EventLogEntries}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
+                                <ItemsControl ItemsSource="{Binding RecentToolCalls}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
                             </ScrollViewer>
                         </Grid>
                     </Border>
@@ -281,9 +294,9 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="Failed Actions" Style="{StaticResource PanelTitleStyle}" />
+                            <TextBlock Grid.Row="0" Text="Failed Tool Calls" Style="{StaticResource PanelTitleStyle}" />
                             <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
-                                <ItemsControl ItemsSource="{Binding FailedActions}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
+                                <ItemsControl ItemsSource="{Binding FailedToolCalls}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
                             </ScrollViewer>
                         </Grid>
                     </Border>
@@ -294,9 +307,35 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="Future Proposed Tools" Style="{StaticResource PanelTitleStyle}" />
+                            <TextBlock Grid.Row="0" Text="Raw Event Log" Style="{StaticResource PanelTitleStyle}" />
                             <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
-                                <ItemsControl ItemsSource="{Binding FutureProposedTools}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
+                                <ItemsControl ItemsSource="{Binding EventLogEntries}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Row="2" Grid.Column="0" Style="{StaticResource PanelBorderStyle}" Margin="0,8,8,0">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Permissions History" Style="{StaticResource PanelTitleStyle}" />
+                            <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
+                                <ItemsControl ItemsSource="{Binding PermissionHistory}" ItemTemplate="{StaticResource SimpleLineTemplate}" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource PanelBorderStyle}" Margin="8,8,0,0">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Mock Proposed Tools" Style="{StaticResource PanelTitleStyle}" />
+                            <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
+                                <ItemsControl ItemsSource="{Binding MockProposedTools}" ItemTemplate="{StaticResource ProposedToolTemplate}" />
                             </ScrollViewer>
                         </Grid>
                     </Border>

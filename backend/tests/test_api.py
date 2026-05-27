@@ -1,10 +1,15 @@
+import asyncio
 from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.assistant.llm_client import DeterministicLLMClient
+from app.assistant.planner import FALLBACK_MESSAGE, Planner
+from app.assistant.policy import PolicyEngine
 from app.main import create_app
-from app.schemas.tools import ToolResult
+from app.schemas.plans import AssistantPlan
+from app.schemas.tools import ConfirmationPolicy, RiskLevel, ToolResult, ToolStatus
 from app.tools.registry import build_default_registry
 
 
@@ -32,6 +37,7 @@ def test_health(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["stage"] == "1.9"
 
 
 def test_sqlite_runtime_pragmas_and_tools_table(client: TestClient) -> None:
@@ -48,6 +54,11 @@ def test_tools_endpoint_lists_stage_one_contracts(client: TestClient) -> None:
     assert response.status_code == 200
     tools = {tool["name"]: tool for tool in response.json()["tools"]}
     assert tools["launch_app"]["status"] == "implemented"
+    assert tools["get_current_time"]["status"] == "implemented"
+    assert tools["list_available_tools"]["status"] == "implemented"
+    assert tools["create_file"]["risk_level"] == "MEDIUM_WRITE"
+    assert tools["send_message"]["risk_level"] == "HIGH_RISK"
+    assert tools["pay_for_order"]["risk_level"] == "HIGH_RISK"
     assert tools["transcribe_audio"]["status"] == "planned"
 
 
@@ -61,6 +72,215 @@ def test_chat_returns_acceptance_only(client: TestClient) -> None:
     assert body["run_id"].startswith("run_")
     assert "assistant_message" not in body
     assert "tool_calls" not in body
+
+
+@pytest.mark.parametrize(
+    ("message", "tool_name", "arguments"),
+    [
+        ("open notepad", "launch_app", {"app_name": "notepad"}),
+        ("launch calculator", "launch_app", {"app_name": "calculator"}),
+        ("start paint", "launch_app", {"app_name": "paint"}),
+        ("open file explorer", "launch_app", {"app_name": "explorer"}),
+        ("what tools do you have", "list_available_tools", {}),
+        ("what time is it", "get_current_time", {}),
+    ],
+)
+def test_rule_based_planner_maps_stage_one_commands(message: str, tool_name: str, arguments: dict[str, object]) -> None:
+    proposal = Planner().propose_tool_call(message)
+
+    assert proposal is not None
+    assert proposal.name == tool_name
+    assert proposal.arguments == arguments
+
+
+def test_rule_based_planner_rejects_unknown_open_targets() -> None:
+    assert Planner().propose_tool_call("open spotify") is None
+
+
+def test_policy_engine_allows_low_risk_implemented_tools() -> None:
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+
+    decision = PolicyEngine().evaluate_tool_call(metadata, {"app_name": "notepad"})
+
+    assert decision.allowed is True
+    assert decision.requires_permission is False
+    assert decision.blocked is False
+
+
+def test_policy_engine_requires_permission_for_confirmed_tools() -> None:
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+    metadata = metadata.model_copy(update={"confirmation_policy": ConfirmationPolicy.before_execute})
+
+    decision = PolicyEngine().evaluate_tool_call(metadata, {"app_name": "notepad"})
+
+    assert decision.allowed is False
+    assert decision.requires_permission is True
+    assert decision.blocked is False
+    assert "requires confirmation" in decision.reason
+
+
+def test_policy_engine_blocks_unimplemented_tools() -> None:
+    registry = build_default_registry()
+    metadata = registry.get("open_file")
+    assert metadata is not None
+
+    decision = PolicyEngine().evaluate_tool_call(metadata, {"path": "demo.txt"})
+
+    assert decision.allowed is False
+    assert decision.requires_permission is False
+    assert decision.blocked is True
+    assert decision.reason == "Tool is not implemented: open_file."
+
+
+@pytest.mark.parametrize(
+    ("risk_level", "allowed", "requires_permission"),
+    [
+        (RiskLevel.read, True, False),
+        (RiskLevel.low_write, True, False),
+        (RiskLevel.medium_write, False, True),
+        (RiskLevel.high_risk, False, True),
+    ],
+)
+def test_policy_engine_applies_stage_one_risk_rules(
+    risk_level: RiskLevel,
+    allowed: bool,
+    requires_permission: bool,
+) -> None:
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+    metadata = metadata.model_copy(update={"risk_level": risk_level, "status": ToolStatus.implemented})
+
+    decision = PolicyEngine().evaluate_tool_call(metadata, {"app_name": "notepad"})
+
+    assert decision.allowed is allowed
+    assert decision.requires_permission is requires_permission
+    assert decision.blocked is False
+
+
+def test_read_only_tools_execute_successfully() -> None:
+    registry = build_default_registry()
+
+    time_result = asyncio.run(registry.execute("get_current_time", {}))
+    tools_result = asyncio.run(registry.execute("list_available_tools", {}))
+
+    assert time_result.status == "success"
+    assert "iso_time" in time_result.output
+    assert tools_result.status == "success"
+    assert any(tool["name"] == "launch_app" for tool in tools_result.output["tools"])
+    assert any(tool["name"] == "get_current_time" for tool in tools_result.output["tools"])
+
+
+def test_deterministic_llm_client_returns_valid_plan_shape() -> None:
+    registry = build_default_registry()
+    llm_client = DeterministicLLMClient()
+
+    reply = asyncio.run(llm_client.complete([{"role": "user", "content": "hello"}]))
+    plan = asyncio.run(llm_client.create_plan("hello", registry.list_tools()))
+
+    assert reply == FALLBACK_MESSAGE
+    assert isinstance(plan, AssistantPlan)
+    assert plan.steps[0].title == "Produce normal assistant reply"
+
+
+def test_normal_chat_uses_llm_reply_without_tool_execution(tmp_path) -> None:
+    class FakeLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            return "Normal assistant reply."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+    app = create_app(database_path=tmp_path / "llm.sqlite3", llm_client=FakeLLMClient())
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "hello there"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(4)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "plan_created",
+        "assistant_message_created",
+    ]
+    assert events[-1]["data"]["message"] == "Normal assistant reply."
+    assert app.state.database.count_rows("tool_calls") == 0
+
+
+def test_permission_required_event_contains_structured_preview(tmp_path) -> None:
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+    metadata = metadata.model_copy(update={"confirmation_policy": ConfirmationPolicy.before_execute})
+
+    async def fake_launch(arguments: dict[str, object]) -> ToolResult:
+        return ToolResult(
+            tool="launch_app",
+            status="success",
+            output={"status": "success", "message": f"Test launch for {arguments['app_name']}."},
+        )
+
+    registry.register(metadata, fake_launch)
+    app = create_app(database_path=tmp_path / "permissions.sqlite3", registry=registry)
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "open notepad"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(5)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "plan_created",
+        "tool_selected",
+        "permission_required",
+    ]
+    permission_event = events[-1]
+    preview = permission_event["data"]["preview"]
+    assert preview["permission_id"] == permission_event["data"]["permission_id"]
+    assert preview["action"] == "Run launch_app"
+    assert preview["target"] == "notepad"
+    assert preview["content"] == {"app_name": "notepad"}
+    assert preview["risk_level"] == "LOW_WRITE"
+    assert preview["what_will_happen"] == "The assistant will launch the whitelisted Windows application 'notepad'."
+    assert preview["editable"] is False
+    assert preview["edit_schema"]["properties"]["app_name"]["type"] == "string"
+    assert app.state.database.count_rows("permissions") == 1
+
+
+def test_unknown_chat_request_uses_clean_stage_one_fallback(client: TestClient) -> None:
+    with client.websocket_connect("/ws/events") as websocket:
+        assert websocket.receive_json()["type"] == "event_stream_connected"
+
+        response = client.post("/chat", json={"message": "open spotify"})
+        assert response.status_code == 200
+
+        event_types = []
+        assistant_message = None
+        for _ in range(4):
+            event = websocket.receive_json()
+            event_types.append(event["type"])
+            if event["type"] == "assistant_message_created":
+                assistant_message = event["data"]["message"]
+
+        assert event_types == [
+            "user_message_received",
+            "assistant_thinking_started",
+            "plan_created",
+            "assistant_message_created",
+        ]
+        assert assistant_message == FALLBACK_MESSAGE
 
 
 def test_chat_persists_trace_tables_from_run_events(client: TestClient) -> None:

@@ -21,3 +21,7 @@ class PlanStep(BaseModel):
 class Plan(BaseModel):
     goal: str
     steps: list[PlanStep]
+
+
+class AssistantPlan(Plan):
+    """Validated plan shape for future LLM planner output."""

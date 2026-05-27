@@ -8,8 +8,9 @@ from fastapi import FastAPI
 from app.api.chat_routes import router as chat_router
 from app.api.permission_routes import router as permission_router
 from app.api.tool_routes import router as tool_router
+from app.assistant.llm_client import LLMClient
 from app.assistant.orchestrator import Orchestrator
-from app.assistant.policy import PermissionManager
+from app.assistant.policy import PermissionManager, PolicyEngine
 from app.config import load_config
 from app.db.database import Database
 from app.events.event_bus import EventBus
@@ -22,17 +23,24 @@ configure_logging()
 LOGGER = logging.getLogger("app.main")
 
 
-def create_app(database_path: str | Path | None = None, registry: ToolRegistry | None = None) -> FastAPI:
+def create_app(
+    database_path: str | Path | None = None,
+    registry: ToolRegistry | None = None,
+    llm_client: LLMClient | None = None,
+) -> FastAPI:
     config = load_config()
     database = Database(database_path or config.database_path)
     event_bus = EventBus()
     registry = registry or build_default_registry()
     permission_manager = PermissionManager(database)
+    policy_engine = PolicyEngine()
     orchestrator = Orchestrator(
         registry=registry,
         database=database,
         permission_manager=permission_manager,
         event_bus=event_bus,
+        policy_engine=policy_engine,
+        llm_client=llm_client,
     )
 
     @asynccontextmanager
@@ -62,7 +70,7 @@ def create_app(database_path: str | Path | None = None, registry: ToolRegistry |
     app = FastAPI(
         title="Desktop Assistant Backend",
         version="0.1.0",
-        description="Stage 1.2 skeleton backend with fake planning and tool results.",
+        description="Stage 1.9 deterministic local assistant runtime.",
         lifespan=lifespan,
     )
     app.state.config = config
@@ -70,6 +78,7 @@ def create_app(database_path: str | Path | None = None, registry: ToolRegistry |
     app.state.event_bus = event_bus
     app.state.registry = registry
     app.state.permission_manager = permission_manager
+    app.state.policy_engine = policy_engine
     app.state.orchestrator = orchestrator
 
     @app.get("/health")
@@ -77,7 +86,7 @@ def create_app(database_path: str | Path | None = None, registry: ToolRegistry |
         return {
             "status": "ok",
             "service": "desktop-assistant-backend",
-            "stage": "1.2",
+            "stage": "1.9",
         }
 
     app.include_router(chat_router)

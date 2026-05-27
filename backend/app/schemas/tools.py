@@ -5,9 +5,10 @@ from pydantic import BaseModel, Field
 
 
 class RiskLevel(str, Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
+    read = "READ"
+    low_write = "LOW_WRITE"
+    medium_write = "MEDIUM_WRITE"
+    high_risk = "HIGH_RISK"
 
 
 class ConfirmationPolicy(str, Enum):
@@ -57,6 +58,20 @@ class PermissionRequest(BaseModel):
     permission_id: str
     tool: str
     reason: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class PermissionPreview(BaseModel):
+    permission_id: str
+    tool_name: str
+    action: str
+    target: str
+    content: dict[str, Any] = Field(default_factory=dict)
+    risk_level: RiskLevel
+    what_will_happen: str
+    reason: str
+    editable: bool = False
+    edit_schema: dict[str, Any] = Field(default_factory=dict)
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 

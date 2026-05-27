@@ -1,6 +1,9 @@
 from dataclasses import dataclass
+import re
 
 from app.schemas.plans import Plan, PlanStep, PlanStepStatus
+
+FALLBACK_MESSAGE = "I cannot do that yet. Available Stage 1 actions are: open Notepad, Calculator, Paint, Explorer."
 
 
 @dataclass(frozen=True)
@@ -22,30 +25,29 @@ class Planner:
         )
 
     def propose_tool_call(self, user_message: str) -> ToolProposal | None:
-        normalized = user_message.strip().lower()
+        normalized = _normalize(user_message)
         if not normalized:
             return None
 
-        app_aliases = {
-            "notepad": "notepad",
-            "calculator": "calculator",
-            "calc": "calculator",
-            "paint": "paint",
-            "mspaint": "paint",
-            "explorer": "explorer",
-        }
-        for alias, app_name in app_aliases.items():
-            if alias in normalized:
-                return ToolProposal(name="launch_app", arguments={"app_name": app_name})
+        if _is_tool_listing_request(normalized):
+            return ToolProposal(name="list_available_tools", arguments={})
 
-        if normalized.startswith("open "):
-            return ToolProposal(name="launch_app", arguments={"app_name": normalized.removeprefix("open ").strip()})
+        if _is_time_request(normalized):
+            return ToolProposal(name="get_current_time", arguments={})
+
+        app_name = _match_app_request(normalized)
+        if app_name is not None:
+            return ToolProposal(name="launch_app", arguments={"app_name": app_name})
 
         return None
 
     @staticmethod
     def _goal_from_message(user_message: str) -> str:
-        normalized = user_message.strip().lower()
+        normalized = _normalize(user_message)
+        if _is_tool_listing_request(normalized):
+            return "List available tools"
+        if _is_time_request(normalized):
+            return "Get current time"
         if "notepad" in normalized:
             return "Open Notepad"
         if "calculator" in normalized or "calc" in normalized:
@@ -57,3 +59,52 @@ class Planner:
         if normalized:
             return f"Handle request: {user_message.strip()}"
         return "Handle empty request"
+
+
+def _normalize(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _is_tool_listing_request(normalized: str) -> bool:
+    return normalized in {
+        "what tools do you have",
+        "what tools are available",
+        "list tools",
+        "list available tools",
+        "show tools",
+        "show available tools",
+        "what can you do",
+    }
+
+
+def _is_time_request(normalized: str) -> bool:
+    return normalized in {
+        "what time is it",
+        "what is the current time",
+        "current time",
+        "get current time",
+        "tell me the time",
+        "time",
+    }
+
+
+def _match_app_request(normalized: str) -> str | None:
+    app_aliases = {
+        "notepad": "notepad",
+        "calculator": "calculator",
+        "calc": "calculator",
+        "paint": "paint",
+        "mspaint": "paint",
+        "explorer": "explorer",
+        "file explorer": "explorer",
+        "windows explorer": "explorer",
+    }
+
+    for alias, app_name in app_aliases.items():
+        if normalized == alias:
+            return app_name
+        pattern = rf"^(open|launch|start|run)\s+(the\s+)?{re.escape(alias)}$"
+        if re.match(pattern, normalized):
+            return app_name
+
+    return None

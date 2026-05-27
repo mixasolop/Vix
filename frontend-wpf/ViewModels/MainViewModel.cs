@@ -42,10 +42,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         DisabledTools.Add("Backend not connected");
         EventLogEntries.Add("No events received");
         FailedActions.Add("No failed actions");
-        FutureProposedTools.Add("window_focus");
-        FutureProposedTools.Add("clipboard_read");
-        FutureProposedTools.Add("clipboard_write");
-        FutureProposedTools.Add("screenshot_region");
+        RecentToolCalls.Add("No tool calls yet");
+        FailedToolCalls.Add("No failed tool calls");
+        PermissionHistory.Add("No permission history yet");
+        MockProposedTools.Add("search_files - not implemented");
+        MockProposedTools.Add("open_file - not implemented");
+        MockProposedTools.Add("capture_active_window - not implemented");
 
         RefreshSettings();
     }
@@ -112,7 +114,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public ObservableCollection<string> FailedActions { get; } = [];
 
-    public ObservableCollection<string> FutureProposedTools { get; } = [];
+    public ObservableCollection<string> RecentToolCalls { get; } = [];
+
+    public ObservableCollection<string> FailedToolCalls { get; } = [];
+
+    public ObservableCollection<string> PermissionHistory { get; } = [];
+
+    public ObservableCollection<string> MockProposedTools { get; } = [];
 
     public ObservableCollection<StatusItem> Settings { get; } = [];
 
@@ -299,16 +307,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
             case "tool_result":
                 ApplyPlanIfPresent(assistantEvent.Data);
+                var resultToolName = GetString(assistantEvent.Data, "tool_name");
+                var resultArguments = GetObjectMap(assistantEvent.Data, "arguments");
+                var resultStatus = GetString(assistantEvent.Data, "status");
                 AddToolTrace(
-                    GetString(assistantEvent.Data, "tool_name"),
-                    GetObjectMap(assistantEvent.Data, "arguments"),
-                    GetString(assistantEvent.Data, "status"));
+                    resultToolName,
+                    resultArguments,
+                    resultStatus);
+                AddRecentToolCall(resultToolName, resultArguments, resultStatus);
                 break;
 
             case "permission_required":
                 _currentPermissionId = GetString(assistantEvent.Data, "permission_id");
                 PermissionItems.Clear();
-                PermissionItems.Add(FormatPermission(assistantEvent.Data));
+                foreach (var line in FormatPermission(assistantEvent.Data))
+                {
+                    PermissionItems.Add(line);
+                }
+                AddPermissionHistory(assistantEvent.Data, "pending");
                 ApprovePermissionCommand.RaiseCanExecuteChanged();
                 RejectPermissionCommand.RaiseCanExecuteChanged();
                 break;
@@ -317,13 +333,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             case "permission_rejected":
                 PermissionItems.Clear();
                 PermissionItems.Add(assistantEvent.Type == "permission_approved" ? "Permission approved" : "Permission rejected");
+                AddPermissionDecisionHistory(assistantEvent.Data, assistantEvent.Type == "permission_approved" ? "approved" : "rejected");
                 _currentPermissionId = null;
                 ApprovePermissionCommand.RaiseCanExecuteChanged();
                 RejectPermissionCommand.RaiseCanExecuteChanged();
                 break;
 
             case "error_occurred":
-                FailedActions.Insert(0, GetString(assistantEvent.Data, "message"));
+                InsertWithLimit(FailedActions, GetString(assistantEvent.Data, "message"), "No failed actions");
                 break;
         }
     }
@@ -448,6 +465,46 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         collection.Add(value);
     }
 
+    private void AddRecentToolCall(string toolName, Dictionary<string, object?> arguments, string status)
+    {
+        var line = $"{toolName} [{status}] - {FormatObjectMap(arguments)}";
+        InsertWithLimit(RecentToolCalls, line, "No tool calls yet");
+        if (!string.Equals(status, "success", StringComparison.OrdinalIgnoreCase))
+        {
+            InsertWithLimit(FailedToolCalls, line, "No failed tool calls");
+        }
+    }
+
+    private void AddPermissionHistory(Dictionary<string, object?> data, string status)
+    {
+        var permissionId = GetString(data, "permission_id");
+        var preview = GetObjectMap(data, "preview");
+        var action = GetPreviewString(preview, "action", GetString(data, "action_type"));
+        var riskLevel = GetPreviewString(preview, "risk_level", "unknown");
+        var target = GetPreviewString(preview, "target", "Unknown target");
+        InsertWithLimit(PermissionHistory, $"{permissionId} [{status}] {action} -> {target} ({riskLevel})", "No permission history yet");
+    }
+
+    private void AddPermissionDecisionHistory(Dictionary<string, object?> data, string status)
+    {
+        var permissionId = GetString(data, "permission_id");
+        InsertWithLimit(PermissionHistory, $"{permissionId} [{status}]", "No permission history yet");
+    }
+
+    private static void InsertWithLimit(ObservableCollection<string> collection, string value, string placeholder, int limit = 40)
+    {
+        if (collection.Count == 1 && collection[0] == placeholder)
+        {
+            collection.Clear();
+        }
+
+        collection.Insert(0, value);
+        while (collection.Count > limit)
+        {
+            collection.RemoveAt(collection.Count - 1);
+        }
+    }
+
     private void ApplyPlanIfPresent(Dictionary<string, object?> data)
     {
         if (!data.TryGetValue("plan", out var value))
@@ -507,13 +564,21 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         return [];
     }
 
-    private static string FormatPermission(Dictionary<string, object?> data)
+    private static IEnumerable<string> FormatPermission(Dictionary<string, object?> data)
     {
         var permissionId = GetString(data, "permission_id");
         var preview = GetObjectMap(data, "preview");
         var actionType = GetString(data, "action_type");
-        var reason = preview.TryGetValue("reason", out var reasonValue) ? FormatObject(reasonValue) : "Permission required";
-        return $"{permissionId}: {actionType} - {reason}";
+
+        yield return "Permission required";
+        yield return $"Permission: {permissionId}";
+        yield return $"Action: {FormatPermissionAction(actionType, preview)}";
+        yield return $"Target: {FormatPermissionTarget(preview)}";
+        yield return $"Preview: {FormatPermissionPreview(preview)}";
+        yield return $"Risk level: {GetPreviewString(preview, "risk_level", "unknown")}";
+        yield return $"What exactly will happen: {GetPreviewString(preview, "what_will_happen", "Permission is required before this action runs.")}";
+        yield return $"Reason: {GetPreviewString(preview, "reason", "Permission required")}";
+        yield return $"Edit: {FormatEditState(preview)}";
     }
 
     private static string FormatObjectMap(Dictionary<string, object?> values)
@@ -534,6 +599,89 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             JsonElement element => element.ValueKind == JsonValueKind.String ? element.GetString() ?? string.Empty : element.ToString(),
             _ => value.ToString() ?? string.Empty,
         };
+    }
+
+    private static string GetPreviewString(Dictionary<string, object?> preview, string key, string fallback)
+    {
+        return preview.TryGetValue(key, out var value) ? FormatObject(value) : fallback;
+    }
+
+    private static string FormatPreviewValue(Dictionary<string, object?> preview, string key)
+    {
+        if (!preview.TryGetValue(key, out var value))
+        {
+            return "{}";
+        }
+
+        if (value is Dictionary<string, object?> dictionary)
+        {
+            return FormatObjectMap(dictionary);
+        }
+
+        if (value is JsonElement element && element.ValueKind == JsonValueKind.Object)
+        {
+            return FormatObjectMap(element.EnumerateObject().ToDictionary(property => property.Name, property => (object?)property.Value.Clone()));
+        }
+
+        return FormatObject(value);
+    }
+
+    private static string FormatPermissionAction(string actionType, Dictionary<string, object?> preview)
+    {
+        if (string.Equals(actionType, "send_message", StringComparison.OrdinalIgnoreCase)
+            && preview.TryGetValue("recipient", out var recipient))
+        {
+            return $"Send message to {FormatObject(recipient)}";
+        }
+
+        return GetPreviewString(preview, "action", actionType);
+    }
+
+    private static string FormatPermissionTarget(Dictionary<string, object?> preview)
+    {
+        if (preview.TryGetValue("target", out var target))
+        {
+            return FormatObject(target);
+        }
+
+        if (preview.TryGetValue("recipient", out var recipient))
+        {
+            return FormatObject(recipient);
+        }
+
+        return "Unknown target";
+    }
+
+    private static string FormatPermissionPreview(Dictionary<string, object?> preview)
+    {
+        if (preview.TryGetValue("message", out var message))
+        {
+            return $"\"{FormatObject(message)}\"";
+        }
+
+        if (preview.TryGetValue("content", out _))
+        {
+            return FormatPreviewValue(preview, "content");
+        }
+
+        return FormatObjectMap(preview);
+    }
+
+    private static string FormatEditState(Dictionary<string, object?> preview)
+    {
+        if (!preview.TryGetValue("editable", out var value))
+        {
+            return "Disabled for Stage 1";
+        }
+
+        var editable = value switch
+        {
+            bool boolValue => boolValue,
+            JsonElement element when element.ValueKind is JsonValueKind.True or JsonValueKind.False => element.GetBoolean(),
+            _ => false,
+        };
+
+        return editable ? "Available" : "Disabled for Stage 1";
     }
 
     private static string FormatEventJson(AssistantEventDto assistantEvent)
