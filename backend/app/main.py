@@ -16,6 +16,7 @@ from app.config import AppConfig, load_config
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.logging_config import configure_logging
+from app.schemas.ai import AIStatusResponse
 from app.tools.registry import build_default_registry
 from app.tools.registry import ToolRegistry
 from app.ws.event_stream import router as event_stream_router
@@ -91,6 +92,10 @@ def create_app(
             "stage": "2.0",
         }
 
+    @app.get("/ai/status", response_model=AIStatusResponse)
+    async def ai_status() -> AIStatusResponse:
+        return await _get_ai_status(app.state.config, app.state.orchestrator.llm_client)
+
     app.include_router(chat_router)
     app.include_router(tool_router)
     app.include_router(permission_router)
@@ -112,6 +117,53 @@ def _build_llm_client(config: AppConfig) -> LLMClient:
         return DeterministicLLMClient()
 
     return OpenAILLMClient(api_key=config.openai_api_key, model=config.ai_proposal_model)
+
+
+async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusResponse:
+    api_key_configured = bool(config.openai_api_key)
+    if not config.ai_proposals_enabled:
+        return AIStatusResponse(
+            provider=config.ai_provider,
+            model=config.ai_proposal_model,
+            proposals_enabled=False,
+            api_key_configured=api_key_configured,
+            connected=False,
+            status="disabled",
+            detail="AI proposals are disabled. Set AI_PROPOSALS_ENABLED=true to verify and use OpenAI proposals.",
+        )
+
+    if config.ai_provider.lower() != "openai":
+        return AIStatusResponse(
+            provider=config.ai_provider,
+            model=config.ai_proposal_model,
+            proposals_enabled=True,
+            api_key_configured=api_key_configured,
+            connected=False,
+            status="unsupported_provider",
+            detail=f"Unsupported AI_PROVIDER '{config.ai_provider}'. Only OpenAI is implemented.",
+        )
+
+    if not api_key_configured:
+        return AIStatusResponse(
+            provider=config.ai_provider,
+            model=config.ai_proposal_model,
+            proposals_enabled=True,
+            api_key_configured=False,
+            connected=False,
+            status="missing_api_key",
+            detail="OPENAI_API_KEY is not configured.",
+        )
+
+    connected, detail = await llm_client.verify_connection()
+    return AIStatusResponse(
+        provider=config.ai_provider,
+        model=config.ai_proposal_model,
+        proposals_enabled=True,
+        api_key_configured=True,
+        connected=connected,
+        status="connected" if connected else "verification_failed",
+        detail=detail,
+    )
 
 
 app = create_app()

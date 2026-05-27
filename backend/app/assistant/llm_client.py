@@ -31,6 +31,9 @@ class LLMClient(Protocol):
     async def propose_tool_spec(self, user_message: str, existing_tools: list[ToolDefinition]) -> ProposedToolDraft | None:
         """Return a proposed tool spec. Stage 2 stores it for developer review only."""
 
+    async def verify_connection(self) -> tuple[bool, str]:
+        """Check whether the configured model endpoint is reachable."""
+
 
 class DeterministicLLMClient:
     async def complete(self, messages: list[dict[str, object]]) -> str:
@@ -46,6 +49,9 @@ class DeterministicLLMClient:
 
     async def propose_tool_spec(self, user_message: str, existing_tools: list[ToolDefinition]) -> ProposedToolDraft | None:
         return propose_missing_tool(user_message)
+
+    async def verify_connection(self) -> tuple[bool, str]:
+        return False, "AI proposals are disabled; using deterministic proposer."
 
 
 class OpenAILLMClient:
@@ -99,6 +105,13 @@ class OpenAILLMClient:
         if not content:
             return None
         return ProposedToolDraft.model_validate_json(content)
+
+    async def verify_connection(self) -> tuple[bool, str]:
+        try:
+            await self._get_client().models.retrieve(self._model)
+        except Exception as exc:
+            return False, f"OpenAI model verification failed: {exc}"
+        return True, f"OpenAI model '{self._model}' is reachable."
 
     def _get_client(self):
         if self._client is None:

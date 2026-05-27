@@ -9,7 +9,7 @@ from app.assistant.llm_client import DeterministicLLMClient, OpenAILLMClient
 from app.assistant.planner import FALLBACK_MESSAGE, Planner
 from app.assistant.policy import PolicyEngine
 from app.config import AppConfig
-from app.main import _build_llm_client, create_app
+from app.main import _build_llm_client, _get_ai_status, create_app
 from app.schemas.plans import AssistantPlan
 from app.schemas.proposed_tools import ProposedToolDraft
 from app.schemas.tools import ConfirmationPolicy, RiskLevel, ToolResult, ToolStatus
@@ -263,6 +263,42 @@ def test_openai_client_is_selected_only_when_enabled() -> None:
     config = AppConfig(openai_api_key="test-key", ai_proposals_enabled=True)
 
     assert isinstance(_build_llm_client(config), OpenAILLMClient)
+
+
+def test_ai_status_endpoint_reports_disabled_by_default(client: TestClient) -> None:
+    response = client.get("/ai/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "openai"
+    assert body["model"] == "gpt-5.4-mini"
+    assert body["proposals_enabled"] is False
+    assert body["connected"] is False
+    assert body["status"] == "disabled"
+
+
+def test_ai_status_reports_missing_api_key_when_enabled() -> None:
+    config = AppConfig(openai_api_key=None, ai_proposals_enabled=True)
+
+    status = asyncio.run(_get_ai_status(config, DeterministicLLMClient()))
+
+    assert status.connected is False
+    assert status.status == "missing_api_key"
+    assert status.detail == "OPENAI_API_KEY is not configured."
+
+
+def test_ai_status_verifies_configured_model() -> None:
+    class FakeLLMClient(DeterministicLLMClient):
+        async def verify_connection(self) -> tuple[bool, str]:
+            return True, "verified"
+
+    config = AppConfig(openai_api_key="test-key", ai_proposals_enabled=True)
+
+    status = asyncio.run(_get_ai_status(config, FakeLLMClient()))
+
+    assert status.connected is True
+    assert status.status == "connected"
+    assert status.detail == "verified"
 
 
 def test_normal_chat_uses_llm_reply_without_tool_execution(tmp_path) -> None:

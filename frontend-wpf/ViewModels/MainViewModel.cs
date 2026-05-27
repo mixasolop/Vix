@@ -23,6 +23,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string? _currentPermissionId;
     private string _backendStatus = "Disconnected";
     private string _backendStatusDetail = "Backend has not been checked yet.";
+    private string _aiStatus = "Unknown";
+    private string _aiStatusDetail = "AI status has not been checked yet.";
+    private string _aiModel = "Unknown";
     private string _draftInput = string.Empty;
     private string _goalTitle = "No active plan";
     private string _toolTracePlaceholder = "No tool calls yet";
@@ -148,6 +151,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             await _eventStreamReady.Task.WaitAsync(TimeSpan.FromSeconds(5), _shutdown.Token);
 
             SetBackendStatus("Connected", "Backend is available at http://127.0.0.1:8000.");
+            await LoadAiStatusAsync(_shutdown.Token);
             await LoadRegisteredToolsAsync(_shutdown.Token);
             await LoadProposedToolsAsync(_shutdown.Token);
             _isReady = true;
@@ -488,6 +492,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         RefreshSettings();
     }
 
+    private async Task LoadAiStatusAsync(CancellationToken cancellationToken)
+    {
+        var aiStatus = await _backendHttpClient.GetAiStatusAsync(cancellationToken);
+        _aiStatus = FormatAiStatus(aiStatus);
+        _aiModel = $"{aiStatus.Provider}/{aiStatus.Model}";
+        _aiStatusDetail = aiStatus.Detail;
+        RefreshSettings();
+    }
+
     private void RefreshSettings()
     {
         Settings.Clear();
@@ -499,16 +512,31 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         });
         Settings.Add(new StatusItem
         {
-            Label = "API key status",
-            Value = "Not configured",
-            Detail = "Keys stay out of WPF and will be owned by the backend.",
+            Label = "AI connection",
+            Value = _aiStatus,
+            Detail = _aiStatusDetail,
         });
         Settings.Add(new StatusItem
         {
-            Label = "Model selection",
-            Value = "Later",
-            Detail = "The model picker is intentionally a disabled placeholder.",
+            Label = "AI model",
+            Value = _aiModel,
+            Detail = "OpenAI is used only for proposed-tool specs. The model cannot execute tools, modify files, or approve proposals.",
         });
+    }
+
+    private static string FormatAiStatus(AiStatusDto aiStatus)
+    {
+        if (!aiStatus.ProposalsEnabled)
+        {
+            return "Disabled";
+        }
+
+        if (!aiStatus.ApiKeyConfigured)
+        {
+            return "Missing API key";
+        }
+
+        return aiStatus.Connected ? "Connected" : $"Not connected ({aiStatus.Status})";
     }
 
     private static void ReplaceWithSingle(ObservableCollection<string> collection, string value)

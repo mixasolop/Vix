@@ -38,6 +38,10 @@ class Orchestrator:
         self._llm_client = llm_client or DeterministicLLMClient()
         self._active_tasks: set[asyncio.Task[None]] = set()
 
+    @property
+    def llm_client(self) -> LLMClient:
+        return self._llm_client
+
     async def start_chat(self, request: ChatRequest) -> ChatAcceptedResponse:
         session_id = request.conversation_id or f"sess_{uuid4()}"
         run_id = f"run_{uuid4()}"

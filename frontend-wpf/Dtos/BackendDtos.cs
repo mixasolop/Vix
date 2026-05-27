@@ -130,6 +130,30 @@ public sealed class ProposedToolDto
     public string OutputSchemaText => $"Output schema: {JsonSerializer.Serialize(OutputSchema)}";
 }
 
+public sealed class AiStatusDto
+{
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = string.Empty;
+
+    [JsonPropertyName("model")]
+    public string Model { get; set; } = string.Empty;
+
+    [JsonPropertyName("proposals_enabled")]
+    public bool ProposalsEnabled { get; set; }
+
+    [JsonPropertyName("api_key_configured")]
+    public bool ApiKeyConfigured { get; set; }
+
+    [JsonPropertyName("connected")]
+    public bool Connected { get; set; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [JsonPropertyName("detail")]
+    public string Detail { get; set; } = string.Empty;
+}
+
 public sealed class AssistantEventDto
 {
     [JsonPropertyName("event_id")]

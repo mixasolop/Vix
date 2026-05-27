@@ -73,6 +73,15 @@ public sealed class BackendHttpClient : IDisposable
         return toolsResponse?.Tools ?? [];
     }
 
+    public async Task<AiStatusDto> GetAiStatusAsync(CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync("/ai/status", cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var aiStatus = await response.Content.ReadFromJsonAsync<AiStatusDto>(JsonOptions, cancellationToken);
+        return aiStatus ?? throw new InvalidOperationException("Backend returned an empty AI status response.");
+    }
+
     public async Task ApprovePermissionAsync(string permissionId, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.PostAsync($"/permissions/{permissionId}/approve", content: null, cancellationToken);
