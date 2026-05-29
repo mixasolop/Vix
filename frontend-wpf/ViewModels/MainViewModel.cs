@@ -26,6 +26,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string _aiStatus = "Unknown";
     private string _aiStatusDetail = "AI status has not been checked yet.";
     private string _aiModel = "Unknown";
+    private string _aiConfigFile = "backend/.env";
+    private string _aiCapabilities = "Unknown";
     private string _draftInput = string.Empty;
     private string _goalTitle = "No active plan";
     private string _toolTracePlaceholder = "No tool calls yet";
@@ -41,6 +43,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         ApproveProposedToolCommand = new AsyncRelayCommand(ApproveProposedToolAsync, HasProposedToolId);
         RejectProposedToolCommand = new AsyncRelayCommand(RejectProposedToolAsync, HasProposedToolId);
         NeedsChangesProposedToolCommand = new AsyncRelayCommand(NeedsChangesProposedToolAsync, HasProposedToolId);
+        RefreshAiStatusCommand = new AsyncRelayCommand(RefreshAiStatusAsync);
 
         PermissionItems.Add("No pending permissions");
         ImplementedTools.Add("Backend not connected");
@@ -68,6 +71,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public AsyncRelayCommand RejectProposedToolCommand { get; }
 
     public AsyncRelayCommand NeedsChangesProposedToolCommand { get; }
+
+    public AsyncRelayCommand RefreshAiStatusCommand { get; }
 
     public string DraftInput
     {
@@ -497,8 +502,26 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         var aiStatus = await _backendHttpClient.GetAiStatusAsync(cancellationToken);
         _aiStatus = FormatAiStatus(aiStatus);
         _aiModel = $"{aiStatus.Provider}/{aiStatus.Model}";
+        _aiConfigFile = string.IsNullOrWhiteSpace(aiStatus.ConfigFilePath)
+            ? "backend/.env"
+            : aiStatus.ConfigFilePath;
+        _aiCapabilities = FormatAiCapabilities(aiStatus);
         _aiStatusDetail = aiStatus.Detail;
         RefreshSettings();
+    }
+
+    private async Task RefreshAiStatusAsync()
+    {
+        try
+        {
+            await LoadAiStatusAsync(_shutdown.Token);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _aiStatus = "Error";
+            _aiStatusDetail = ex.Message;
+            RefreshSettings();
+        }
     }
 
     private void RefreshSettings()
@@ -520,13 +543,25 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             Label = "AI model",
             Value = _aiModel,
-            Detail = "OpenAI is used only for proposed-tool specs. The model cannot execute tools, modify files, or approve proposals.",
+            Detail = "OpenAI is used for general answers and optional proposed-tool specs. The model cannot execute tools, modify files, or approve proposals.",
+        });
+        Settings.Add(new StatusItem
+        {
+            Label = "AI capabilities",
+            Value = _aiCapabilities,
+            Detail = "Tool execution remains deterministic and goes through the registry, policy engine, and permissions.",
+        });
+        Settings.Add(new StatusItem
+        {
+            Label = "AI config file",
+            Value = _aiConfigFile,
+            Detail = "This local file is ignored by git and can hold OPENAI_API_KEY, AI_PROVIDER, AI_PROPOSAL_MODEL, and AI_PROPOSALS_ENABLED.",
         });
     }
 
     private static string FormatAiStatus(AiStatusDto aiStatus)
     {
-        if (!aiStatus.ProposalsEnabled)
+        if (!aiStatus.GeneralAnswersEnabled && !aiStatus.ProposalsEnabled)
         {
             return "Disabled";
         }
@@ -537,6 +572,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
 
         return aiStatus.Connected ? "Connected" : $"Not connected ({aiStatus.Status})";
+    }
+
+    private static string FormatAiCapabilities(AiStatusDto aiStatus)
+    {
+        var generalAnswers = aiStatus.GeneralAnswersEnabled ? "general answers: enabled" : "general answers: disabled";
+        var proposals = aiStatus.ProposalsEnabled ? "tool proposals: enabled" : "tool proposals: disabled";
+        var executionMode = string.IsNullOrWhiteSpace(aiStatus.ToolExecutionMode)
+            ? "tool execution: deterministic only"
+            : $"tool execution: {aiStatus.ToolExecutionMode}";
+        return $"{generalAnswers}; {proposals}; {executionMode}";
     }
 
     private static void ReplaceWithSingle(ObservableCollection<string> collection, string value)

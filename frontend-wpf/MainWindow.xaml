@@ -369,6 +369,11 @@
                             <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
                                 <StackPanel MaxWidth="720" HorizontalAlignment="Left">
                                     <ItemsControl ItemsSource="{Binding Settings}" ItemTemplate="{StaticResource StatusItemTemplate}" />
+                                    <Button Content="Refresh AI status"
+                                            Command="{Binding RefreshAiStatusCommand}"
+                                            Style="{StaticResource ActionButtonStyle}"
+                                            HorizontalAlignment="Left"
+                                            Margin="172,0,0,14" />
                                     <TextBlock Text="Model selection later"
                                                Style="{StaticResource MutedTextStyle}"
                                                Margin="0,10,0,8" />

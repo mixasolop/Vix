@@ -7,6 +7,7 @@ from typing import Any
 
 from app.schemas.tools import ConfirmationPolicy, RetryPolicy, RiskLevel, ToolDefinition, ToolResult, ToolStatus
 from app.tools.system_tools import get_current_time, launch_app
+from app.tools.weather_tools import get_weather
 
 LOGGER = logging.getLogger("app.tools.registry")
 ToolExecutor = Callable[[dict[str, object]], Awaitable[ToolResult]]
@@ -166,6 +167,23 @@ def _time_output_schema() -> dict[str, Any]:
     )
 
 
+def _weather_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "location": {"type": "string"},
+            "date": {"type": "string"},
+            "temperature": {"type": "object"},
+            "condition": {"type": "string"},
+            "precipitation_probability": {"type": "number"},
+            "wind": {"type": "object"},
+            "source": {"type": "string"},
+        },
+        ["status", "message", "location", "temperature", "condition", "precipitation_probability", "wind", "source"],
+    )
+
+
 def _list_available_tools_definition() -> ToolDefinition:
     return ToolDefinition(
         name="list_available_tools",
@@ -235,6 +253,26 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
             get_current_time,
+        ),
+        (
+            ToolDefinition(
+                name="get_weather",
+                description="Return current or forecast weather for a named location using Open-Meteo.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema(
+                    {
+                        "location": {"type": "string"},
+                        "date": {"type": "string", "description": "today, tomorrow, or YYYY-MM-DD"},
+                    },
+                    ["location", "date"],
+                ),
+                output_schema=_weather_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            get_weather,
         ),
         (
             ToolDefinition(

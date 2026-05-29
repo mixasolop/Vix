@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Protocol
 
 from app.assistant.missing_tool_proposer import propose_missing_tool
@@ -6,6 +7,16 @@ from app.assistant.planner import FALLBACK_MESSAGE
 from app.schemas.plans import AssistantPlan, PlanStep, PlanStepStatus
 from app.schemas.proposed_tools import ALLOWED_PROPOSED_TOOL_RISK_LEVELS, ProposedToolDraft
 from app.schemas.tools import ToolDefinition
+
+LOGGER = logging.getLogger("app.assistant.llm_client")
+
+VIX_SYSTEM_PROMPT = """
+You are Vix, a Windows desktop assistant.
+Be concise, technical, and useful.
+Do not claim you performed actions unless a tool result confirms it.
+For real-time information, use tools instead of guessing.
+For write or external actions, require permission.
+""".strip()
 
 OPENAI_PROPOSAL_SYSTEM_PROMPT = """
 You generate proposed tool specifications for a safe desktop assistant.
@@ -29,7 +40,7 @@ class LLMClient(Protocol):
         """Return a validated plan shape for future LLM tool planning."""
 
     async def propose_tool_spec(self, user_message: str, existing_tools: list[ToolDefinition]) -> ProposedToolDraft | None:
-        """Return a proposed tool spec. Stage 2 stores it for developer review only."""
+        """Return a proposed tool spec for developer review only."""
 
     async def verify_connection(self) -> tuple[bool, str]:
         """Check whether the configured model endpoint is reachable."""
@@ -51,22 +62,48 @@ class DeterministicLLMClient:
         return propose_missing_tool(user_message)
 
     async def verify_connection(self) -> tuple[bool, str]:
-        return False, "AI proposals are disabled; using deterministic proposer."
+        return False, "OpenAI is not connected; using deterministic assistant fallbacks."
 
 
 class OpenAILLMClient:
-    def __init__(self, api_key: str, model: str = "gpt-5.4-mini", client: object | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-5.4-mini",
+        client: object | None = None,
+        tool_proposals_enabled: bool = True,
+    ) -> None:
         self._api_key = api_key
         self._model = model
         self._client = client
+        self._tool_proposals_enabled = tool_proposals_enabled
 
     async def complete(self, messages: list[dict[str, object]]) -> str:
-        return FALLBACK_MESSAGE
+        request_messages = _with_system_prompt(messages)
+        LOGGER.info(
+            "llm completion request | provider=openai | model=%s | messages=%s",
+            self._model,
+            len(request_messages),
+        )
+        response = await self._get_client().chat.completions.create(
+            model=self._model,
+            messages=request_messages,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            LOGGER.warning("llm completion response was empty | provider=openai | model=%s", self._model)
+            return "I could not generate an answer right now."
+        LOGGER.info("llm completion raw output | provider=openai | model=%s | text=%s", self._model, _short_text(content, limit=4000))
+        return str(content).strip()
 
     async def create_plan(self, user_text: str, tools: list[ToolDefinition]) -> AssistantPlan:
         return await DeterministicLLMClient().create_plan(user_text, tools)
 
     async def propose_tool_spec(self, user_message: str, existing_tools: list[ToolDefinition]) -> ProposedToolDraft | None:
+        if not self._tool_proposals_enabled:
+            return propose_missing_tool(user_message)
+
+        LOGGER.info("ai proposal request | provider=openai | model=%s | message=%s", self._model, _short_text(user_message))
         response = await self._get_client().chat.completions.create(
             model=self._model,
             messages=[
@@ -103,8 +140,18 @@ class OpenAILLMClient:
         )
         content = response.choices[0].message.content
         if not content:
+            LOGGER.warning("ai proposal response was empty | provider=openai | model=%s", self._model)
             return None
-        return ProposedToolDraft.model_validate_json(content)
+        LOGGER.info("ai proposal raw output | provider=openai | model=%s | json=%s", self._model, _short_text(content, limit=4000))
+        draft = ProposedToolDraft.model_validate_json(content)
+        LOGGER.info(
+            "ai proposal validated | name=%s | risk=%s | description=%s | reason=%s",
+            draft.name,
+            draft.risk_level,
+            _short_text(draft.description),
+            _short_text(draft.reason),
+        )
+        return draft
 
     async def verify_connection(self) -> tuple[bool, str]:
         try:
@@ -135,3 +182,16 @@ def _proposed_tool_draft_schema() -> dict[str, object]:
         "required": ["name", "description", "reason", "risk_level", "input_schema", "output_schema"],
         "additionalProperties": False,
     }
+
+
+def _with_system_prompt(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    if messages and messages[0].get("role") == "system":
+        return messages
+    return [{"role": "system", "content": VIX_SYSTEM_PROMPT}, *messages]
+
+
+def _short_text(value: str, limit: int = 300) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}..."

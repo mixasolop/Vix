@@ -6,6 +6,12 @@ from uuid import uuid4
 from app.assistant.llm_client import DeterministicLLMClient, LLMClient
 from app.assistant.planner import FALLBACK_MESSAGE, Planner
 from app.assistant.policy import PendingAction, PermissionManager, PolicyEngine
+from app.assistant.request_classifier import (
+    RequestCategory,
+    RequestClassification,
+    classify_request,
+    should_propose_missing_tool_after_answer,
+)
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.schemas.chat import ChatAcceptedResponse, ChatRequest
@@ -41,6 +47,9 @@ class Orchestrator:
     @property
     def llm_client(self) -> LLMClient:
         return self._llm_client
+
+    def set_llm_client(self, llm_client: LLMClient) -> None:
+        self._llm_client = llm_client
 
     async def start_chat(self, request: ChatRequest) -> ChatAcceptedResponse:
         session_id = request.conversation_id or f"sess_{uuid4()}"
@@ -115,10 +124,57 @@ class Orchestrator:
             )
             await self._emit("assistant_thinking_started", session_id, run_id, {})
 
-            plan = self._planner.create_plan(normalized_message)
+            classification = classify_request(normalized_message, self._planner)
+            LOGGER.info(
+                "request classified | session=%s | run=%s | category=%s | reason=%s",
+                session_id,
+                run_id,
+                classification.category.value,
+                classification.reason,
+            )
+            await self._emit(
+                "request_classified",
+                session_id,
+                run_id,
+                {
+                    "category": classification.category.value,
+                    "reason": classification.reason,
+                    "tool_name": classification.tool_proposal.name if classification.tool_proposal else None,
+                    "arguments": classification.tool_proposal.arguments if classification.tool_proposal else {},
+                    "missing_input": classification.missing_input,
+                },
+            )
+            plan = self._create_plan_for_request(normalized_message, classification)
+            LOGGER.info(
+                "planner plan created | session=%s | run=%s | plan=%s",
+                session_id,
+                run_id,
+                plan.model_dump_json(),
+            )
             await self._emit_plan("plan_created", session_id, run_id, plan)
 
-            proposal = self._planner.propose_tool_call(normalized_message)
+            if classification.category == RequestCategory.general_answer:
+                await self._answer_with_llm(session_id, run_id, normalized_message)
+                return
+
+            if classification.category == RequestCategory.realtime_info:
+                await self._handle_realtime_info(session_id, run_id, classification, plan)
+                return
+
+            if classification.category == RequestCategory.missing_tool:
+                proposed_tool = await self._propose_missing_tool(session_id, run_id, normalized_message)
+                if proposed_tool is not None:
+                    assistant_message = f"I cannot do this yet, but I proposed a new tool: {proposed_tool.name}."
+                    await self._finish_without_tool(session_id, run_id, assistant_message)
+                    return
+                await self._finish_without_tool(session_id, run_id, FALLBACK_MESSAGE)
+                return
+
+            if classification.category == RequestCategory.unsafe_or_blocked:
+                await self._fail_run(session_id, run_id, classification.reason)
+                return
+
+            proposal = classification.tool_proposal
             if proposal is None:
                 LOGGER.info("planner produced no tool call | session=%s | run=%s", session_id, run_id)
                 proposed_tool = await self._propose_missing_tool(session_id, run_id, normalized_message)
@@ -234,6 +290,207 @@ class Orchestrator:
             LOGGER.exception("run failed with unhandled exception | session=%s | run=%s", session_id, run_id)
             await self._fail_run(session_id, run_id, str(exc))
 
+    async def _answer_with_llm(self, session_id: str, run_id: str, user_message: str) -> None:
+        messages = self._recent_session_messages(session_id)
+        await self._emit(
+            "llm_response_started",
+            session_id,
+            run_id,
+            {"message_count": len(messages), "purpose": "general_answer"},
+        )
+        try:
+            assistant_message = await self._llm_client.complete(messages)
+        except Exception as exc:
+            LOGGER.exception("llm completion failed | session=%s | run=%s", session_id, run_id)
+            await self._emit(
+                "llm_response_finished",
+                session_id,
+                run_id,
+                {"status": "failed", "error": str(exc), "purpose": "general_answer"},
+            )
+            await self._finish_without_tool(session_id, run_id, "I could not get an AI answer right now. Please try again.")
+            return
+
+        await self._emit(
+            "llm_response_finished",
+            session_id,
+            run_id,
+            {"status": "success", "purpose": "general_answer", "message": assistant_message},
+        )
+        if should_propose_missing_tool_after_answer(user_message, assistant_message):
+            proposed_tool = await self._propose_missing_tool(session_id, run_id, user_message)
+            if proposed_tool is not None:
+                assistant_message = (
+                    f"{assistant_message}\n\n"
+                    f"I also proposed a new tool for developer review: {proposed_tool.name}."
+                )
+
+        await self._finish_without_tool(session_id, run_id, assistant_message or FALLBACK_MESSAGE)
+
+    async def _handle_realtime_info(
+        self,
+        session_id: str,
+        run_id: str,
+        classification: RequestClassification,
+        plan: Plan,
+    ) -> None:
+        if classification.missing_input == "location":
+            await self._finish_without_tool(session_id, run_id, "Which city should I check?")
+            return
+
+        if classification.tool_proposal is None:
+            await self._finish_without_tool(session_id, run_id, "I need a real-time information tool for that, but I cannot map this request yet.")
+            return
+
+        selected_plan = self._plan_with_statuses(plan, select_status=PlanStepStatus.completed, execute_status=PlanStepStatus.pending)
+        await self._execute_classified_tool(session_id, run_id, classification.tool_proposal, selected_plan)
+
+    async def _execute_classified_tool(
+        self,
+        session_id: str,
+        run_id: str,
+        proposal,
+        selected_plan: Plan,
+    ) -> None:
+        metadata = self._registry.get(proposal.name)
+        if metadata is None:
+            LOGGER.error("classifier selected unregistered tool | tool=%s | session=%s | run=%s", proposal.name, session_id, run_id)
+            await self._fail_run(session_id, run_id, f"Tool is not registered: {proposal.name}.")
+            return
+
+        policy_decision = self._policy_engine.evaluate_tool_call(metadata, proposal.arguments)
+        if policy_decision.blocked:
+            LOGGER.warning(
+                "policy blocked tool call | tool=%s | session=%s | run=%s | reason=%s",
+                proposal.name,
+                session_id,
+                run_id,
+                policy_decision.reason,
+            )
+            await self._fail_run(session_id, run_id, policy_decision.reason)
+            return
+
+        await self._emit(
+            "tool_selected",
+            session_id,
+            run_id,
+            {
+                "tool_name": proposal.name,
+                "arguments": proposal.arguments,
+                "risk_level": metadata.risk_level.value,
+                "confirmation_policy": metadata.confirmation_policy.value,
+                "policy_decision": {
+                    "allowed": policy_decision.allowed,
+                    "requires_permission": policy_decision.requires_permission,
+                    "blocked": policy_decision.blocked,
+                    "reason": policy_decision.reason,
+                },
+                "plan": selected_plan.model_dump(mode="json"),
+            },
+        )
+
+        if policy_decision.requires_permission:
+            permission_id = str(uuid4())
+            LOGGER.info(
+                "permission required | permission=%s | tool=%s | session=%s | run=%s",
+                permission_id,
+                proposal.name,
+                session_id,
+                run_id,
+            )
+            permission = PermissionRequest(
+                permission_id=permission_id,
+                tool=proposal.name,
+                reason=policy_decision.reason,
+                arguments=proposal.arguments,
+            )
+            preview = self._build_permission_preview(
+                permission_id=permission_id,
+                tool=metadata,
+                arguments=proposal.arguments,
+                reason=permission.reason,
+            ).model_dump(mode="json")
+            self._database.create_permission(
+                permission_id=permission_id,
+                session_id=session_id,
+                action_type=proposal.name,
+                preview=preview,
+            )
+            self._permission_manager.add_pending_action(
+                PendingAction(
+                    permission_id=permission_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    tool_name=proposal.name,
+                    arguments=proposal.arguments,
+                )
+            )
+            await self._emit(
+                "permission_required",
+                session_id,
+                run_id,
+                {
+                    "permission_id": permission_id,
+                    "action_type": proposal.name,
+                    "preview": preview,
+                    "permission": permission.model_dump(mode="json"),
+                },
+            )
+            return
+
+        if not policy_decision.allowed:
+            LOGGER.error(
+                "policy returned non-executable decision | tool=%s | session=%s | run=%s | reason=%s",
+                proposal.name,
+                session_id,
+                run_id,
+                policy_decision.reason,
+            )
+            await self._fail_run(session_id, run_id, policy_decision.reason)
+            return
+
+        await self._execute_tool(session_id, run_id, proposal.name, proposal.arguments, selected_plan)
+
+    def _create_plan_for_request(self, user_message: str, classification: RequestClassification) -> Plan:
+        if classification.category == RequestCategory.general_answer:
+            return Plan(
+                goal=f"Answer: {user_message}",
+                steps=[
+                    PlanStep(number=1, title="Understand question", status=PlanStepStatus.completed),
+                    PlanStep(number=2, title="Generate LLM answer", status=PlanStepStatus.pending),
+                ],
+            )
+
+        if classification.category == RequestCategory.realtime_info:
+            return Plan(
+                goal=f"Fetch real-time information: {user_message}",
+                steps=[
+                    PlanStep(number=1, title="Understand request", status=PlanStepStatus.completed),
+                    PlanStep(number=2, title="Select real-time tool", status=PlanStepStatus.pending),
+                    PlanStep(number=3, title="Execute", status=PlanStepStatus.pending),
+                ],
+            )
+
+        if classification.category == RequestCategory.missing_tool:
+            return Plan(
+                goal=f"Handle missing capability: {user_message}",
+                steps=[
+                    PlanStep(number=1, title="Understand request", status=PlanStepStatus.completed),
+                    PlanStep(number=2, title="Propose missing tool", status=PlanStepStatus.pending),
+                ],
+            )
+
+        if classification.category == RequestCategory.unsafe_or_blocked:
+            return Plan(
+                goal=f"Block unsafe request: {user_message}",
+                steps=[
+                    PlanStep(number=1, title="Understand request", status=PlanStepStatus.completed),
+                    PlanStep(number=2, title="Apply safety policy", status=PlanStepStatus.pending),
+                ],
+            )
+
+        return self._planner.create_plan(user_message)
+
     async def _execute_pending_action(self, action: PendingAction) -> None:
         plan = self._plan_with_statuses(
             Plan(
@@ -320,10 +577,26 @@ class Orchestrator:
         self._database.log_message(session_id, "assistant", assistant_message)
         await self._emit("assistant_message_created", session_id, run_id, {"role": "assistant", "message": assistant_message})
 
+    def _recent_session_messages(self, session_id: str, limit: int = 20) -> list[dict[str, object]]:
+        records = self._database.list_messages(session_id)[-limit:]
+        messages: list[dict[str, object]] = []
+        for record in records:
+            if record.role not in {"user", "assistant", "system"}:
+                continue
+            messages.append({"role": record.role, "content": record.content})
+        return messages
+
     async def _propose_missing_tool(self, session_id: str, run_id: str, user_message: str) -> ProposedTool | None:
         draft = await self._llm_client.propose_tool_spec(user_message, self._registry.list_tools())
         if draft is None:
             return None
+
+        LOGGER.info(
+            "missing capability proposed tool draft | session=%s | run=%s | draft=%s",
+            session_id,
+            run_id,
+            draft.model_dump_json(),
+        )
 
         proposed_tool = self._database.create_proposed_tool(
             CreateProposedToolRequest(

@@ -138,6 +138,12 @@ public sealed class AiStatusDto
     [JsonPropertyName("model")]
     public string Model { get; set; } = string.Empty;
 
+    [JsonPropertyName("config_file_path")]
+    public string ConfigFilePath { get; set; } = string.Empty;
+
+    [JsonPropertyName("general_answers_enabled")]
+    public bool GeneralAnswersEnabled { get; set; }
+
     [JsonPropertyName("proposals_enabled")]
     public bool ProposalsEnabled { get; set; }
 
@@ -152,6 +158,9 @@ public sealed class AiStatusDto
 
     [JsonPropertyName("detail")]
     public string Detail { get; set; } = string.Empty;
+
+    [JsonPropertyName("tool_execution_mode")]
+    public string ToolExecutionMode { get; set; } = string.Empty;
 }
 
 public sealed class AssistantEventDto

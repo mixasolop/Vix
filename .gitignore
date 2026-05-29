@@ -14,6 +14,14 @@ venv/
 *.sqlite3
 *.db
 
+# Local secrets and machine-specific config
+.env
+.env.*
+backend/.env
+backend/.env.*
+!.env.example
+!backend/.env.example
+
 # Editors
 .vs/
 .vscode/

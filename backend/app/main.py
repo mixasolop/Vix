@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from app.api.tool_routes import router as tool_router
 from app.assistant.llm_client import DeterministicLLMClient, LLMClient, OpenAILLMClient
 from app.assistant.orchestrator import Orchestrator
 from app.assistant.policy import PermissionManager, PolicyEngine
-from app.config import AppConfig, load_config
+from app.config import AppConfig, load_config, load_config_from_file
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.logging_config import configure_logging
@@ -29,8 +30,12 @@ def create_app(
     database_path: str | Path | None = None,
     registry: ToolRegistry | None = None,
     llm_client: LLMClient | None = None,
+    config: AppConfig | None = None,
+    reload_config_from_file: bool | None = None,
 ) -> FastAPI:
-    config = load_config()
+    should_reload_config = config is None if reload_config_from_file is None else reload_config_from_file
+    user_supplied_llm_client = llm_client is not None
+    config = config or load_config()
     database = Database(database_path or config.database_path)
     event_bus = EventBus()
     registry = registry or build_default_registry()
@@ -72,8 +77,8 @@ def create_app(
 
     app = FastAPI(
         title="Desktop Assistant Backend",
-        version="0.1.0",
-        description="Stage 2 safe tool proposal and review runtime.",
+        version="0.2.0",
+        description="Stage 3 general answer, weather, and safe tool proposal runtime.",
         lifespan=lifespan,
     )
     app.state.config = config
@@ -83,17 +88,56 @@ def create_app(
     app.state.permission_manager = permission_manager
     app.state.policy_engine = policy_engine
     app.state.orchestrator = orchestrator
+    app.state.reload_config_from_file = should_reload_config
+    app.state.user_supplied_llm_client = user_supplied_llm_client
+    app.state.ai_config_signature = _ai_config_signature(config)
+
+    def refresh_runtime_config() -> AppConfig:
+        if not app.state.reload_config_from_file:
+            return app.state.config
+
+        refreshed_config = load_config_from_file(app.state.config.config_file_path)
+        if refreshed_config == app.state.config:
+            return app.state.config
+
+        previous_signature = app.state.ai_config_signature
+        next_signature = _ai_config_signature(refreshed_config)
+        app.state.config = refreshed_config
+        LOGGER.info(
+            "runtime config reloaded | file=%s | ai_provider=%s | ai_model=%s | ai_general_answers_enabled=%s | ai_proposals_enabled=%s | api_key_configured=%s",
+            refreshed_config.config_file_path,
+            refreshed_config.ai_provider,
+            refreshed_config.ai_proposal_model,
+            refreshed_config.ai_general_answers_enabled,
+            refreshed_config.ai_proposals_enabled,
+            bool(refreshed_config.openai_api_key),
+        )
+
+        if previous_signature != next_signature and not app.state.user_supplied_llm_client:
+            app.state.orchestrator.set_llm_client(_build_llm_client(refreshed_config))
+            app.state.ai_config_signature = next_signature
+            LOGGER.info(
+                "llm client refreshed | ai_provider=%s | ai_model=%s | ai_general_answers_enabled=%s | ai_proposals_enabled=%s",
+                refreshed_config.ai_provider,
+                refreshed_config.ai_proposal_model,
+                refreshed_config.ai_general_answers_enabled,
+                refreshed_config.ai_proposals_enabled,
+            )
+        return app.state.config
+
+    app.state.refresh_runtime_config = refresh_runtime_config
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {
             "status": "ok",
             "service": "desktop-assistant-backend",
-            "stage": "2.0",
+            "stage": "3.0",
         }
 
     @app.get("/ai/status", response_model=AIStatusResponse)
     async def ai_status() -> AIStatusResponse:
+        app.state.refresh_runtime_config()
         return await _get_ai_status(app.state.config, app.state.orchestrator.llm_client)
 
     app.include_router(chat_router)
@@ -105,64 +149,94 @@ def create_app(
 
 
 def _build_llm_client(config: AppConfig) -> LLMClient:
-    if not config.ai_proposals_enabled:
+    if not config.ai_general_answers_enabled and not config.ai_proposals_enabled:
         return DeterministicLLMClient()
 
     if config.ai_provider.lower() != "openai":
-        LOGGER.warning("AI proposals disabled because unsupported AI_PROVIDER=%s", config.ai_provider)
+        LOGGER.warning("AI disabled because unsupported AI_PROVIDER=%s", config.ai_provider)
         return DeterministicLLMClient()
 
     if not config.openai_api_key:
-        LOGGER.warning("AI proposals disabled because OPENAI_API_KEY is not configured")
+        LOGGER.warning("AI disabled because OPENAI_API_KEY is not configured")
         return DeterministicLLMClient()
 
-    return OpenAILLMClient(api_key=config.openai_api_key, model=config.ai_proposal_model)
+    return OpenAILLMClient(
+        api_key=config.openai_api_key,
+        model=config.ai_proposal_model,
+        tool_proposals_enabled=config.ai_proposals_enabled,
+    )
+
+
+def _ai_config_signature(config: AppConfig) -> tuple[str, str, bool, bool, str | None]:
+    return (
+        config.ai_provider,
+        config.ai_proposal_model,
+        config.ai_general_answers_enabled,
+        config.ai_proposals_enabled,
+        config.openai_api_key,
+    )
 
 
 async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusResponse:
     api_key_configured = bool(config.openai_api_key)
-    if not config.ai_proposals_enabled:
+    if not config.ai_general_answers_enabled and not config.ai_proposals_enabled:
         return AIStatusResponse(
             provider=config.ai_provider,
             model=config.ai_proposal_model,
+            config_file_path=str(config.config_file_path),
+            general_answers_enabled=False,
             proposals_enabled=False,
             api_key_configured=api_key_configured,
             connected=False,
             status="disabled",
-            detail="AI proposals are disabled. Set AI_PROPOSALS_ENABLED=true to verify and use OpenAI proposals.",
+            detail="AI is disabled. Set AI_GENERAL_ANSWERS_ENABLED=true or AI_PROPOSALS_ENABLED=true in backend/.env.",
+            tool_execution_mode="deterministic",
         )
 
     if config.ai_provider.lower() != "openai":
         return AIStatusResponse(
             provider=config.ai_provider,
             model=config.ai_proposal_model,
-            proposals_enabled=True,
+            config_file_path=str(config.config_file_path),
+            general_answers_enabled=config.ai_general_answers_enabled,
+            proposals_enabled=config.ai_proposals_enabled,
             api_key_configured=api_key_configured,
             connected=False,
             status="unsupported_provider",
             detail=f"Unsupported AI_PROVIDER '{config.ai_provider}'. Only OpenAI is implemented.",
+            tool_execution_mode="deterministic",
         )
 
     if not api_key_configured:
         return AIStatusResponse(
             provider=config.ai_provider,
             model=config.ai_proposal_model,
-            proposals_enabled=True,
+            config_file_path=str(config.config_file_path),
+            general_answers_enabled=config.ai_general_answers_enabled,
+            proposals_enabled=config.ai_proposals_enabled,
             api_key_configured=False,
             connected=False,
             status="missing_api_key",
-            detail="OPENAI_API_KEY is not configured.",
+            detail="OPENAI_API_KEY is not configured in backend/.env.",
+            tool_execution_mode="deterministic",
         )
 
-    connected, detail = await llm_client.verify_connection()
+    try:
+        connected, detail = await asyncio.wait_for(llm_client.verify_connection(), timeout=8)
+    except TimeoutError:
+        connected = False
+        detail = "OpenAI model verification timed out after 8 seconds."
     return AIStatusResponse(
         provider=config.ai_provider,
         model=config.ai_proposal_model,
-        proposals_enabled=True,
+        config_file_path=str(config.config_file_path),
+        general_answers_enabled=config.ai_general_answers_enabled,
+        proposals_enabled=config.ai_proposals_enabled,
         api_key_configured=True,
         connected=connected,
         status="connected" if connected else "verification_failed",
         detail=detail,
+        tool_execution_mode="deterministic",
     )
 
 
