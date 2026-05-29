@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Protocol
 
 from app.assistant.missing_tool_proposer import propose_missing_tool
@@ -157,7 +158,7 @@ class OpenAILLMClient:
         try:
             await self._get_client().models.retrieve(self._model)
         except Exception as exc:
-            return False, f"OpenAI model verification failed: {exc}"
+            return False, f"OpenAI model verification failed: {redact_secrets(str(exc))}"
         return True, f"OpenAI model '{self._model}' is reachable."
 
     def _get_client(self):
@@ -195,3 +196,8 @@ def _short_text(value: str, limit: int = 300) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[:limit]}..."
+
+
+def redact_secrets(value: str) -> str:
+    value = re.sub(r"sk-[A-Za-z0-9_\\-]{8,}", "sk-***REDACTED***", value)
+    return re.sub(r"(OPENAI_API_KEY=)[^\\s]+", r"\\1***REDACTED***", value)

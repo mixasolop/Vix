@@ -150,6 +150,9 @@ public sealed class AiStatusDto
     [JsonPropertyName("api_key_configured")]
     public bool ApiKeyConfigured { get; set; }
 
+    [JsonPropertyName("api_key_fingerprint")]
+    public string? ApiKeyFingerprint { get; set; }
+
     [JsonPropertyName("model_reachable")]
     public bool ModelReachable { get; set; }
 

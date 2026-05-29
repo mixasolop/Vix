@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from app.api.context_routes import router as context_router
 from app.api.permission_routes import router as permission_router
 from app.api.proposed_tool_routes import router as proposed_tool_router
 from app.api.tool_routes import router as tool_router
-from app.assistant.llm_client import DeterministicLLMClient, LLMClient, OpenAILLMClient
+from app.assistant.llm_client import DeterministicLLMClient, LLMClient, OpenAILLMClient, redact_secrets
 from app.assistant.orchestrator import Orchestrator
 from app.assistant.policy import PermissionManager, PolicyEngine
 from app.config import AppConfig, load_config, load_config_from_file
@@ -124,13 +125,14 @@ def create_app(
         next_signature = _ai_config_signature(refreshed_config)
         app.state.config = refreshed_config
         LOGGER.info(
-            "runtime config reloaded | file=%s | ai_provider=%s | ai_model=%s | ai_general_answers_enabled=%s | ai_proposals_enabled=%s | api_key_configured=%s",
+            "runtime config reloaded | file=%s | ai_provider=%s | ai_model=%s | ai_general_answers_enabled=%s | ai_proposals_enabled=%s | api_key_configured=%s | api_key_fingerprint=%s",
             refreshed_config.config_file_path,
             refreshed_config.ai_provider,
             refreshed_config.ai_proposal_model,
             refreshed_config.ai_general_answers_enabled,
             refreshed_config.ai_proposals_enabled,
             bool(refreshed_config.openai_api_key),
+            _api_key_fingerprint(refreshed_config.openai_api_key),
         )
 
         if previous_signature != next_signature and not app.state.user_supplied_llm_client:
@@ -212,6 +214,7 @@ def _ai_config_signature(config: AppConfig) -> tuple[str, str, bool, bool, str |
 
 async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusResponse:
     api_key_configured = bool(config.openai_api_key)
+    api_key_fingerprint = _api_key_fingerprint(config.openai_api_key)
     if not config.ai_general_answers_enabled and not config.ai_proposals_enabled:
         return AIStatusResponse(
             provider=config.ai_provider,
@@ -220,6 +223,7 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
             general_answers_enabled=False,
             proposals_enabled=False,
             api_key_configured=api_key_configured,
+            api_key_fingerprint=api_key_fingerprint,
             model_reachable=False,
             connected=False,
             status="disabled",
@@ -242,6 +246,7 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
             general_answers_enabled=config.ai_general_answers_enabled,
             proposals_enabled=config.ai_proposals_enabled,
             api_key_configured=api_key_configured,
+            api_key_fingerprint=api_key_fingerprint,
             model_reachable=False,
             connected=False,
             status="unsupported_provider",
@@ -261,6 +266,7 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
             general_answers_enabled=config.ai_general_answers_enabled,
             proposals_enabled=config.ai_proposals_enabled,
             api_key_configured=False,
+            api_key_fingerprint=None,
             model_reachable=False,
             connected=False,
             status="missing_api_key",
@@ -274,6 +280,7 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
 
     try:
         connected, detail = await asyncio.wait_for(llm_client.verify_connection(), timeout=8)
+        detail = redact_secrets(detail)
     except TimeoutError:
         connected = False
         detail = "OpenAI model verification timed out after 8 seconds."
@@ -285,6 +292,7 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
         general_answers_enabled=config.ai_general_answers_enabled,
         proposals_enabled=config.ai_proposals_enabled,
         api_key_configured=True,
+        api_key_fingerprint=api_key_fingerprint,
         model_reachable=connected,
         connected=connected,
         status="connected" if connected else "verification_failed",
@@ -295,6 +303,12 @@ async def _get_ai_status(config: AppConfig, llm_client: LLMClient) -> AIStatusRe
         detail=detail,
         tool_execution_mode="deterministic",
     )
+
+
+def _api_key_fingerprint(api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
 
 
 app = create_app(start_context_tracker=True)

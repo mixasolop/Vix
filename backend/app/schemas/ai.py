@@ -8,6 +8,7 @@ class AIStatusResponse(BaseModel):
     general_answers_enabled: bool
     proposals_enabled: bool
     api_key_configured: bool
+    api_key_fingerprint: str | None = None
     model_reachable: bool
     connected: bool
     status: str

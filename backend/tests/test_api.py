@@ -395,6 +395,28 @@ def test_config_can_load_private_backend_env_file(tmp_path, monkeypatch: pytest.
     assert config.ai_proposals_enabled is True
 
 
+def test_config_file_overrides_process_environment_for_ai_settings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-old-environment-key")
+    monkeypatch.setenv("AI_PROPOSALS_ENABLED", "false")
+    config_file = tmp_path / ".env"
+    config_file.write_text(
+        "\n".join(
+            [
+                "OPENAI_API_KEY=sk-proj-new-file-key",
+                "AI_PROVIDER=openai",
+                "AI_PROPOSAL_MODEL=gpt-5.4-mini",
+                "AI_PROPOSALS_ENABLED=true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config_from_file(config_file)
+
+    assert config.openai_api_key == "sk-proj-new-file-key"
+    assert config.ai_proposals_enabled is True
+
+
 def test_openai_client_is_selected_when_any_ai_capability_is_enabled() -> None:
     config = AppConfig(openai_api_key="test-key", ai_proposals_enabled=True)
 
@@ -541,6 +563,19 @@ def test_ai_status_timeout_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     assert status.tool_proposals_status == "model_unreachable"
     assert status.model_status == "unreachable"
     assert status.detail == "OpenAI model verification timed out after 8 seconds."
+
+
+def test_ai_status_redacts_api_key_from_openai_errors() -> None:
+    class InvalidKeyLLMClient(DeterministicLLMClient):
+        async def verify_connection(self) -> tuple[bool, str]:
+            return False, "OpenAI model verification failed: Incorrect API key provided: sk-proj-secret123456"
+
+    config = AppConfig(openai_api_key="sk-proj-secret123456", ai_proposals_enabled=True)
+
+    status = asyncio.run(_get_ai_status(config, InvalidKeyLLMClient()))
+
+    assert status.connected is False
+    assert "sk-proj-secret123456" not in status.detail
 
 
 def test_normal_chat_uses_llm_reply_without_tool_execution(tmp_path) -> None:

@@ -31,6 +31,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string _generalAnswersStatus = "Unknown";
     private string _toolProposalsStatus = "Unknown";
     private string _apiKeyStatus = "Unknown";
+    private string _apiKeyFingerprint = "None";
     private string _modelReachabilityStatus = "Unknown";
     private WindowInfoDto? _currentForegroundWindow;
     private WindowInfoDto? _lastContextWindow;
@@ -528,6 +529,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         _generalAnswersStatus = FormatGeneralAnswersStatus(aiStatus);
         _toolProposalsStatus = FormatToolProposalsStatus(aiStatus);
         _apiKeyStatus = FormatApiKeyStatus(aiStatus);
+        _apiKeyFingerprint = string.IsNullOrWhiteSpace(aiStatus.ApiKeyFingerprint) ? "None" : aiStatus.ApiKeyFingerprint;
         _modelReachabilityStatus = FormatModelReachabilityStatus(aiStatus);
         _aiStatusDetail = aiStatus.Detail;
         RefreshSettings();
@@ -578,7 +580,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             Label = "API key",
             Value = _apiKeyStatus,
-            Detail = "Configured only in the local backend/.env file; it is not committed to git.",
+            Detail = $"Loaded only from local backend/.env. Safe fingerprint: {_apiKeyFingerprint}.",
         });
         Settings.Add(new StatusItem
         {

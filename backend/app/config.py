@@ -1,5 +1,4 @@
 from functools import lru_cache
-import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -62,27 +61,21 @@ def _read_key_value_file(config_file_path: Path) -> dict[str, str]:
 
 
 def _config_value(name: str, file_values: dict[str, str], default: str) -> str:
-    value = os.getenv(name)
-    if value is None:
-        value = file_values.get(name)
+    value = file_values.get(name)
     if value is None or value.strip() == "":
         return default
     return value.strip()
 
 
 def _optional_config_value(name: str, file_values: dict[str, str]) -> str | None:
-    value = os.getenv(name)
-    if value is None:
-        value = file_values.get(name)
+    value = file_values.get(name)
     if value is None or value.strip() == "":
         return None
     return value.strip()
 
 
 def _config_bool(name: str, file_values: dict[str, str], default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        value = file_values.get(name)
+    value = file_values.get(name)
     return _str_bool(value, default)
 
 
