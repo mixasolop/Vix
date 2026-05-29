@@ -1,0 +1,3 @@
+for now okey, future dix:
+
+-when write dont lauch calculator it does launch, fix the plan making and checking for whether to use AI or not, design better plan

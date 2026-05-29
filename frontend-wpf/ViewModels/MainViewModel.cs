@@ -28,6 +28,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string _aiModel = "Unknown";
     private string _aiConfigFile = "backend/.env";
     private string _aiCapabilities = "Unknown";
+    private string _generalAnswersStatus = "Unknown";
+    private string _toolProposalsStatus = "Unknown";
+    private string _apiKeyStatus = "Unknown";
+    private string _modelReachabilityStatus = "Unknown";
+    private WindowInfoDto? _currentForegroundWindow;
+    private WindowInfoDto? _lastContextWindow;
+    private Dictionary<string, object?>? _lastContextArtifact;
     private string _draftInput = string.Empty;
     private string _goalTitle = "No active plan";
     private string _toolTracePlaceholder = "No tool calls yet";
@@ -54,6 +61,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         RecentToolCalls.Add("No tool calls yet");
         FailedToolCalls.Add("No failed tool calls");
         PermissionHistory.Add("No permission history yet");
+        RefreshContextPanel();
 
         RefreshSettings();
     }
@@ -138,6 +146,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public ObservableCollection<StatusItem> Settings { get; } = [];
 
+    public ObservableCollection<StatusItem> ContextStatus { get; } = [];
+
     public async Task InitializeAsync()
     {
         SetBackendStatus("Starting", "Checking local backend health.");
@@ -159,6 +169,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             await LoadAiStatusAsync(_shutdown.Token);
             await LoadRegisteredToolsAsync(_shutdown.Token);
             await LoadProposedToolsAsync(_shutdown.Token);
+            await LoadContextStatusAsync(_shutdown.Token);
             _isReady = true;
             SendCommand.RaiseCanExecuteChanged();
         }
@@ -400,6 +411,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 ApplyProposedToolIfPresent(assistantEvent.Data);
                 break;
 
+            case "context_window_updated":
+                ApplyContextWindowIfPresent(assistantEvent.Data);
+                break;
+
+            case "artifact_created":
+                ApplyArtifactIfPresent(assistantEvent.Data);
+                break;
+
             case "error_occurred":
                 InsertWithLimit(FailedActions, GetString(assistantEvent.Data, "message"), "No failed actions");
                 break;
@@ -506,6 +525,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             ? "backend/.env"
             : aiStatus.ConfigFilePath;
         _aiCapabilities = FormatAiCapabilities(aiStatus);
+        _generalAnswersStatus = FormatGeneralAnswersStatus(aiStatus);
+        _toolProposalsStatus = FormatToolProposalsStatus(aiStatus);
+        _apiKeyStatus = FormatApiKeyStatus(aiStatus);
+        _modelReachabilityStatus = FormatModelReachabilityStatus(aiStatus);
         _aiStatusDetail = aiStatus.Detail;
         RefreshSettings();
     }
@@ -541,6 +564,30 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         });
         Settings.Add(new StatusItem
         {
+            Label = "General answers",
+            Value = _generalAnswersStatus,
+            Detail = "Controls normal questions like explanations and coding help. Requires an API key and reachable model.",
+        });
+        Settings.Add(new StatusItem
+        {
+            Label = "Tool proposals",
+            Value = _toolProposalsStatus,
+            Detail = "Controls whether unsupported requests become proposed tools for developer review.",
+        });
+        Settings.Add(new StatusItem
+        {
+            Label = "API key",
+            Value = _apiKeyStatus,
+            Detail = "Configured only in the local backend/.env file; it is not committed to git.",
+        });
+        Settings.Add(new StatusItem
+        {
+            Label = "Model reachable",
+            Value = _modelReachabilityStatus,
+            Detail = "Backend verification that the configured OpenAI model can be reached.",
+        });
+        Settings.Add(new StatusItem
+        {
             Label = "AI model",
             Value = _aiModel,
             Detail = "OpenAI is used for general answers and optional proposed-tool specs. The model cannot execute tools, modify files, or approve proposals.",
@@ -555,8 +602,79 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             Label = "AI config file",
             Value = _aiConfigFile,
-            Detail = "This local file is ignored by git and can hold OPENAI_API_KEY, AI_PROVIDER, AI_PROPOSAL_MODEL, and AI_PROPOSALS_ENABLED.",
+            Detail = "This local file is ignored by git and can hold OPENAI_API_KEY, AI_PROVIDER, AI_PROPOSAL_MODEL, AI_GENERAL_ANSWERS_ENABLED, and AI_PROPOSALS_ENABLED.",
         });
+    }
+
+    private static string FormatWindowLabel(WindowInfoDto? window, string fallback)
+    {
+        if (window is null)
+        {
+            return fallback;
+        }
+
+        if (!string.IsNullOrWhiteSpace(window.Title))
+        {
+            return window.Title;
+        }
+
+        if (!string.IsNullOrWhiteSpace(window.ProcessName))
+        {
+            return window.ProcessName;
+        }
+
+        return $"HWND {window.Hwnd}";
+    }
+
+    private static string FormatWindowDetail(WindowInfoDto? window, string fallback)
+    {
+        if (window is null)
+        {
+            return fallback;
+        }
+
+        var process = string.IsNullOrWhiteSpace(window.ProcessName) ? "unknown process" : window.ProcessName;
+        var capturedAt = window.CapturedAt == default ? "unknown time" : window.CapturedAt.ToLocalTime().ToString("T");
+        var vixState = window.IsVix ? "Vix window" : "non-Vix window";
+        return $"Process: {process}; HWND: {window.Hwnd}; Captured: {capturedAt}; {vixState}.";
+    }
+
+    private static string FormatArtifactValue(Dictionary<string, object?>? artifact)
+    {
+        if (artifact is null || artifact.Count == 0)
+        {
+            return "No context artifact captured yet";
+        }
+
+        var type = GetPreviewString(artifact, "type", "context");
+        var title = GetPreviewString(artifact, "title", "Captured context");
+        return $"{type}: {title}";
+    }
+
+    private static string FormatArtifactDetail(Dictionary<string, object?>? artifact)
+    {
+        if (artifact is null || artifact.Count == 0)
+        {
+            return "Ask about selected text, clipboard, or your context window to create an artifact.";
+        }
+
+        var content = GetPreviewString(artifact, "content_text", string.Empty);
+        var data = GetObjectMap(artifact, "data");
+        var result = GetObjectMap(data, "result");
+        var method = GetPreviewString(result, "method", GetPreviewString(result, "source", "unknown method"));
+        var restoredClipboard = GetPreviewString(result, "restored_clipboard", "n/a");
+        var preview = string.IsNullOrWhiteSpace(content) ? "no text preview" : $"\"{TrimPreview(content, 160)}\"";
+        return $"Preview: {preview}; Method: {method}; Clipboard restored: {restoredClipboard}.";
+    }
+
+    private static string TrimPreview(string value, int maxLength)
+    {
+        if (value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return $"{value[..maxLength]}...";
     }
 
     private static string FormatAiStatus(AiStatusDto aiStatus)
@@ -584,6 +702,51 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         return $"{generalAnswers}; {proposals}; {executionMode}";
     }
 
+    private static string FormatGeneralAnswersStatus(AiStatusDto aiStatus)
+    {
+        return aiStatus.GeneralAnswersStatus switch
+        {
+            "enabled" => "Enabled",
+            "missing_api_key" => "Missing API key",
+            "model_unreachable" => "Model unreachable",
+            "disabled" => "Disabled",
+            _ => aiStatus.GeneralAnswersEnabled ? "Enabled" : "Disabled",
+        };
+    }
+
+    private static string FormatToolProposalsStatus(AiStatusDto aiStatus)
+    {
+        return aiStatus.ToolProposalsStatus switch
+        {
+            "enabled" => "Enabled",
+            "missing_api_key" => "Missing API key",
+            "model_unreachable" => "Model unreachable",
+            "disabled" => "Disabled",
+            _ => aiStatus.ProposalsEnabled ? "Enabled" : "Disabled",
+        };
+    }
+
+    private static string FormatApiKeyStatus(AiStatusDto aiStatus)
+    {
+        return aiStatus.ApiKeyStatus switch
+        {
+            "configured" => "Configured",
+            "missing" => "Missing",
+            _ => aiStatus.ApiKeyConfigured ? "Configured" : "Missing",
+        };
+    }
+
+    private static string FormatModelReachabilityStatus(AiStatusDto aiStatus)
+    {
+        return aiStatus.ModelStatus switch
+        {
+            "reachable" => "Reachable",
+            "unreachable" => "Unreachable",
+            "not_checked" => "Not checked",
+            _ => aiStatus.ModelReachable ? "Reachable" : "Not checked",
+        };
+    }
+
     private static void ReplaceWithSingle(ObservableCollection<string> collection, string value)
     {
         collection.Clear();
@@ -608,6 +771,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             ProposedTools.Add(proposedTool);
         }
+    }
+
+    private async Task LoadContextStatusAsync(CancellationToken cancellationToken)
+    {
+        var contextStatus = await _backendHttpClient.GetContextStatusAsync(cancellationToken);
+        _currentForegroundWindow = contextStatus.CurrentForegroundWindow;
+        _lastContextWindow = contextStatus.LastContextWindow;
+        _lastContextArtifact = contextStatus.LastContextArtifact;
+        RefreshContextPanel();
     }
 
     private void AddPermissionHistory(Dictionary<string, object?> data, string status)
@@ -680,6 +852,62 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
 
         ProposedTools.Insert(0, proposedTool);
+    }
+
+    private void ApplyContextWindowIfPresent(Dictionary<string, object?> data)
+    {
+        if (!data.TryGetValue("window", out var value))
+        {
+            return;
+        }
+
+        var window = DeserializeValue<WindowInfoDto>(value);
+        if (window is null)
+        {
+            return;
+        }
+
+        _lastContextWindow = window;
+        if (!window.IsVix)
+        {
+            _currentForegroundWindow = window;
+        }
+        RefreshContextPanel();
+    }
+
+    private void ApplyArtifactIfPresent(Dictionary<string, object?> data)
+    {
+        var artifact = GetObjectMap(data, "artifact");
+        if (artifact.Count == 0)
+        {
+            return;
+        }
+
+        _lastContextArtifact = artifact;
+        RefreshContextPanel();
+    }
+
+    private void RefreshContextPanel()
+    {
+        ContextStatus.Clear();
+        ContextStatus.Add(new StatusItem
+        {
+            Label = "Context window",
+            Value = FormatWindowLabel(_lastContextWindow, "No non-Vix window captured yet"),
+            Detail = FormatWindowDetail(_lastContextWindow, "Vix has not seen a previous app/window yet."),
+        });
+        ContextStatus.Add(new StatusItem
+        {
+            Label = "Foreground window",
+            Value = FormatWindowLabel(_currentForegroundWindow, "Unknown"),
+            Detail = FormatWindowDetail(_currentForegroundWindow, "Technical foreground may be Vix while you are typing."),
+        });
+        ContextStatus.Add(new StatusItem
+        {
+            Label = "Last context",
+            Value = FormatArtifactValue(_lastContextArtifact),
+            Detail = FormatArtifactDetail(_lastContextArtifact),
+        });
     }
 
     private static T? DeserializeValue<T>(object? value)

@@ -103,8 +103,14 @@ def _match_app_request(normalized: str) -> str | None:
     for alias, app_name in app_aliases.items():
         if normalized == alias:
             return app_name
-        pattern = rf"^(open|launch|start|run)\s+(the\s+)?{re.escape(alias)}$"
-        if re.match(pattern, normalized):
+        pattern = rf"\b(open|launch|start|run)\s+(the\s+)?{re.escape(alias)}\b"
+        if re.search(pattern, normalized):
+            return app_name
+        if _has_launch_intent(normalized) and re.search(rf"\b{re.escape(alias)}\b", normalized):
             return app_name
 
     return None
+
+
+def _has_launch_intent(normalized: str) -> bool:
+    return re.search(r"\b(open|launch|start|run)\b", normalized) is not None

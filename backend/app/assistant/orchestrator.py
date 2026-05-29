@@ -12,6 +12,7 @@ from app.assistant.request_classifier import (
     classify_request,
     should_propose_missing_tool_after_answer,
 )
+from app.context.window_tracker import WindowTracker
 from app.db.database import Database
 from app.events.event_bus import EventBus
 from app.schemas.chat import ChatAcceptedResponse, ChatRequest
@@ -34,6 +35,7 @@ class Orchestrator:
         planner: Planner | None = None,
         policy_engine: PolicyEngine | None = None,
         llm_client: LLMClient | None = None,
+        context_tracker: WindowTracker | None = None,
     ) -> None:
         self._registry = registry
         self._database = database
@@ -42,6 +44,7 @@ class Orchestrator:
         self._planner = planner or Planner()
         self._policy_engine = policy_engine or PolicyEngine()
         self._llm_client = llm_client or DeterministicLLMClient()
+        self._context_tracker = context_tracker
         self._active_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -159,6 +162,10 @@ class Orchestrator:
 
             if classification.category == RequestCategory.realtime_info:
                 await self._handle_realtime_info(session_id, run_id, classification, plan)
+                return
+
+            if classification.category == RequestCategory.local_context:
+                await self._handle_local_context(session_id, run_id, normalized_message, classification, plan)
                 return
 
             if classification.category == RequestCategory.missing_tool:
@@ -345,6 +352,180 @@ class Orchestrator:
         selected_plan = self._plan_with_statuses(plan, select_status=PlanStepStatus.completed, execute_status=PlanStepStatus.pending)
         await self._execute_classified_tool(session_id, run_id, classification.tool_proposal, selected_plan)
 
+    async def _handle_local_context(
+        self,
+        session_id: str,
+        run_id: str,
+        user_message: str,
+        classification: RequestClassification,
+        plan: Plan,
+    ) -> None:
+        if classification.tool_proposal is None:
+            await self._finish_without_tool(session_id, run_id, "I could not map that context request to a context tool.")
+            return
+
+        context_window = None
+        if classification.tool_proposal.name in {"get_selected_text", "get_context_window_info"}:
+            context_window = self._context_window_data()
+            await self._emit(
+                "context_window_selected",
+                session_id,
+                run_id,
+                {"window": context_window or {}, "tool_name": classification.tool_proposal.name},
+            )
+
+        selected_plan = self._plan_with_statuses(plan, select_status=PlanStepStatus.completed, execute_status=PlanStepStatus.pending)
+        tool_call = await self._execute_context_tool(session_id, run_id, classification.tool_proposal, selected_plan)
+        if tool_call is None:
+            return
+
+        if tool_call.status != "success":
+            await self._finish_without_tool(session_id, run_id, tool_call.error or f"{tool_call.tool} failed.")
+            return
+
+        await self._emit(
+            "context_captured",
+            session_id,
+            run_id,
+            {
+                "tool_name": tool_call.tool,
+                "artifact_type": _artifact_type_for_tool(tool_call.tool),
+                "content_preview": _context_content_preview(tool_call),
+                "context_window": tool_call.result.get("context_window") or tool_call.result.get("window") or {},
+            },
+        )
+
+        artifact = self._create_context_artifact(session_id, run_id, tool_call)
+        if artifact is not None:
+            await self._emit(
+                "artifact_created",
+                session_id,
+                run_id,
+                {
+                    "artifact": {
+                        "id": artifact.id,
+                        "type": artifact.type,
+                        "title": artifact.title,
+                        "content_text": artifact.content_text,
+                        "data": json.loads(artifact.data_json),
+                        "created_at": artifact.created_at.isoformat(),
+                    }
+                },
+            )
+
+        await self._answer_with_context(session_id, run_id, user_message, tool_call)
+
+    async def _answer_with_context(self, session_id: str, run_id: str, user_message: str, tool_call: ToolCall) -> None:
+        context_prompt = _context_prompt(user_message, tool_call)
+        messages = self._recent_session_messages(session_id)
+        messages.append({"role": "user", "content": context_prompt})
+        await self._emit(
+            "llm_response_started",
+            session_id,
+            run_id,
+            {"message_count": len(messages), "purpose": "local_context"},
+        )
+        try:
+            assistant_message = await self._llm_client.complete(messages)
+        except Exception as exc:
+            LOGGER.exception("context llm completion failed | session=%s | run=%s", session_id, run_id)
+            await self._emit(
+                "llm_response_finished",
+                session_id,
+                run_id,
+                {"status": "failed", "error": str(exc), "purpose": "local_context"},
+            )
+            await self._finish_without_tool(session_id, run_id, "I captured the context, but I could not get an AI answer right now.")
+            return
+
+        await self._emit(
+            "llm_response_finished",
+            session_id,
+            run_id,
+            {"status": "success", "purpose": "local_context", "message": assistant_message},
+        )
+        final_message = assistant_message
+        if not final_message or final_message == FALLBACK_MESSAGE:
+            final_message = self._assistant_message_for_tool_result(tool_call)
+        await self._finish_without_tool(session_id, run_id, final_message)
+
+    async def _execute_context_tool(
+        self,
+        session_id: str,
+        run_id: str,
+        proposal,
+        selected_plan: Plan,
+    ) -> ToolCall | None:
+        metadata = self._registry.get(proposal.name)
+        if metadata is None:
+            await self._fail_run(session_id, run_id, f"Tool is not registered: {proposal.name}.")
+            return None
+
+        policy_decision = self._policy_engine.evaluate_tool_call(metadata, proposal.arguments)
+        if policy_decision.blocked:
+            await self._fail_run(session_id, run_id, policy_decision.reason)
+            return None
+
+        await self._emit(
+            "tool_selected",
+            session_id,
+            run_id,
+            {
+                "tool_name": proposal.name,
+                "arguments": proposal.arguments,
+                "risk_level": metadata.risk_level.value,
+                "confirmation_policy": metadata.confirmation_policy.value,
+                "privacy_sensitive": proposal.name in {"get_clipboard_text", "get_selected_text"},
+                "policy_decision": {
+                    "allowed": policy_decision.allowed,
+                    "requires_permission": policy_decision.requires_permission,
+                    "blocked": policy_decision.blocked,
+                    "reason": policy_decision.reason,
+                },
+                "plan": selected_plan.model_dump(mode="json"),
+            },
+        )
+
+        if not policy_decision.allowed:
+            await self._fail_run(session_id, run_id, policy_decision.reason)
+            return None
+
+        running_plan = self._plan_with_statuses(selected_plan, select_status=PlanStepStatus.completed, execute_status=PlanStepStatus.running)
+        await self._emit(
+            "tool_started",
+            session_id,
+            run_id,
+            {"tool_name": proposal.name, "arguments": proposal.arguments, "plan": running_plan.model_dump(mode="json")},
+        )
+
+        result = await self._registry.execute(proposal.name, proposal.arguments)
+        self._database.log_tool_call(
+            session_id=session_id,
+            tool_name=proposal.name,
+            arguments=proposal.arguments,
+            status=result.status,
+            result=result.output,
+            error=result.error,
+        )
+        final_status = PlanStepStatus.completed if result.status == "success" else PlanStepStatus.failed
+        final_plan = self._plan_with_statuses(selected_plan, select_status=PlanStepStatus.completed, execute_status=final_status)
+        tool_call = ToolCall(tool=proposal.name, arguments=proposal.arguments, status=result.status, result=result.output, error=result.error)
+        await self._emit(
+            "tool_result",
+            session_id,
+            run_id,
+            {
+                "tool_name": proposal.name,
+                "arguments": proposal.arguments,
+                "status": result.status,
+                "result": result.output,
+                "error": result.error,
+                "tool_call": tool_call.model_dump(mode="json"),
+                "plan": final_plan.model_dump(mode="json"),
+            },
+        )
+        return tool_call
+
     async def _execute_classified_tool(
         self,
         session_id: str,
@@ -471,6 +652,17 @@ class Orchestrator:
                 ],
             )
 
+        if classification.category == RequestCategory.local_context:
+            return Plan(
+                goal=f"Capture local context for: {user_message}",
+                steps=[
+                    PlanStep(number=1, title="Understand context request", status=PlanStepStatus.completed),
+                    PlanStep(number=2, title="Select context tool", status=PlanStepStatus.pending),
+                    PlanStep(number=3, title="Capture context", status=PlanStepStatus.pending),
+                    PlanStep(number=4, title="Answer using captured context", status=PlanStepStatus.pending),
+                ],
+            )
+
         if classification.category == RequestCategory.missing_tool:
             return Plan(
                 goal=f"Handle missing capability: {user_message}",
@@ -576,6 +768,35 @@ class Orchestrator:
     async def _finish_without_tool(self, session_id: str, run_id: str, assistant_message: str) -> None:
         self._database.log_message(session_id, "assistant", assistant_message)
         await self._emit("assistant_message_created", session_id, run_id, {"role": "assistant", "message": assistant_message})
+
+    def _create_context_artifact(self, session_id: str, run_id: str, tool_call: ToolCall):
+        artifact_type = _artifact_type_for_tool(tool_call.tool)
+        if artifact_type is None:
+            return None
+
+        content_text = tool_call.result.get("text")
+        content_text = str(content_text) if content_text is not None else None
+        title = _artifact_title(tool_call)
+        data = {
+            "tool": tool_call.tool,
+            "arguments": tool_call.arguments,
+            "result": tool_call.result,
+            "dev_mode_full_text_stored": True,
+        }
+        return self._database.create_artifact(
+            session_id=session_id,
+            run_id=run_id,
+            artifact_type=artifact_type,
+            title=title,
+            content_text=content_text,
+            data=data,
+        )
+
+    def _context_window_data(self) -> dict[str, object] | None:
+        if self._context_tracker is None:
+            return None
+        window = self._context_tracker.get_context_window(validate_exists=False)
+        return window.model_dump(mode="json") if window is not None else None
 
     def _recent_session_messages(self, session_id: str, limit: int = 20) -> list[dict[str, object]]:
         records = self._database.list_messages(session_id)[-limit:]
@@ -728,3 +949,67 @@ def _preview_what_will_happen(tool_name: str, target: str) -> str:
     if tool_name == "pay_for_order":
         return f"The assistant will submit payment for order '{target}' after approval."
     return f"The assistant will run '{tool_name}' with the shown content."
+
+
+def _artifact_type_for_tool(tool_name: str) -> str | None:
+    return {
+        "get_clipboard_text": "clipboard_text",
+        "get_selected_text": "selected_text",
+        "get_context_window_info": "context_window_info",
+        "get_foreground_window_info": "foreground_window_info",
+    }.get(tool_name)
+
+
+def _artifact_title(tool_call: ToolCall) -> str:
+    if tool_call.tool == "get_selected_text":
+        window = tool_call.result.get("context_window", {})
+        if isinstance(window, dict):
+            title = window.get("title") or window.get("process_name") or "context window"
+            return f"Selected text from {title}"
+        return "Selected text"
+    if tool_call.tool == "get_clipboard_text":
+        return "Clipboard text"
+    if tool_call.tool == "get_context_window_info":
+        return "Context window info"
+    if tool_call.tool == "get_foreground_window_info":
+        return "Foreground window info"
+    return tool_call.tool
+
+
+def _context_content_preview(tool_call: ToolCall) -> str:
+    text = tool_call.result.get("text")
+    if text is not None:
+        return _short_text(str(text), limit=160)
+    message = tool_call.result.get("message")
+    if message is not None:
+        return _short_text(str(message), limit=160)
+    return ""
+
+
+def _context_prompt(user_message: str, tool_call: ToolCall) -> str:
+    if tool_call.tool in {"get_selected_text", "get_clipboard_text"}:
+        text = str(tool_call.result.get("text", ""))
+        source = "selected text" if tool_call.tool == "get_selected_text" else "clipboard"
+        window = tool_call.result.get("context_window")
+        window_line = ""
+        if isinstance(window, dict):
+            window_line = f"\nSource window: {window.get('title') or ''} ({window.get('process_name') or 'unknown process'})."
+        return (
+            f'User asked: "{user_message}"\n'
+            f"Captured {source}:{window_line}\n"
+            f'"""\n{text}\n"""\n'
+            "Answer using only this captured local context plus general knowledge. "
+            "Do not claim you captured anything else."
+        )
+
+    if tool_call.tool in {"get_context_window_info", "get_foreground_window_info"}:
+        return (
+            f'User asked: "{user_message}"\n'
+            f"Captured window information:\n{json.dumps(tool_call.result, ensure_ascii=False, indent=2, default=str)}\n"
+            "Answer directly from this window information. Distinguish context window from technical foreground if relevant."
+        )
+
+    return (
+        f'User asked: "{user_message}"\n'
+        f"Tool result:\n{json.dumps(tool_call.result, ensure_ascii=False, indent=2, default=str)}"
+    )

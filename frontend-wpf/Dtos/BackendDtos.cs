@@ -150,17 +150,68 @@ public sealed class AiStatusDto
     [JsonPropertyName("api_key_configured")]
     public bool ApiKeyConfigured { get; set; }
 
+    [JsonPropertyName("model_reachable")]
+    public bool ModelReachable { get; set; }
+
     [JsonPropertyName("connected")]
     public bool Connected { get; set; }
 
     [JsonPropertyName("status")]
     public string Status { get; set; } = string.Empty;
 
+    [JsonPropertyName("general_answers_status")]
+    public string GeneralAnswersStatus { get; set; } = string.Empty;
+
+    [JsonPropertyName("tool_proposals_status")]
+    public string ToolProposalsStatus { get; set; } = string.Empty;
+
+    [JsonPropertyName("api_key_status")]
+    public string ApiKeyStatus { get; set; } = string.Empty;
+
+    [JsonPropertyName("model_status")]
+    public string ModelStatus { get; set; } = string.Empty;
+
     [JsonPropertyName("detail")]
     public string Detail { get; set; } = string.Empty;
 
     [JsonPropertyName("tool_execution_mode")]
     public string ToolExecutionMode { get; set; } = string.Empty;
+}
+
+public sealed class WindowInfoDto
+{
+    [JsonPropertyName("hwnd")]
+    public long Hwnd { get; set; }
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = string.Empty;
+
+    [JsonPropertyName("process_id")]
+    public int? ProcessId { get; set; }
+
+    [JsonPropertyName("process_name")]
+    public string? ProcessName { get; set; }
+
+    [JsonPropertyName("executable_path")]
+    public string? ExecutablePath { get; set; }
+
+    [JsonPropertyName("is_vix")]
+    public bool IsVix { get; set; }
+
+    [JsonPropertyName("captured_at")]
+    public DateTimeOffset CapturedAt { get; set; }
+}
+
+public sealed class ContextStatusDto
+{
+    [JsonPropertyName("current_foreground_window")]
+    public WindowInfoDto? CurrentForegroundWindow { get; set; }
+
+    [JsonPropertyName("last_context_window")]
+    public WindowInfoDto? LastContextWindow { get; set; }
+
+    [JsonPropertyName("last_context_artifact")]
+    public Dictionary<string, object?>? LastContextArtifact { get; set; }
 }
 
 public sealed class AssistantEventDto

@@ -9,6 +9,7 @@ class RequestCategory(StrEnum):
     general_answer = "GENERAL_ANSWER"
     local_tool = "LOCAL_TOOL"
     realtime_info = "REALTIME_INFO"
+    local_context = "LOCAL_CONTEXT"
     missing_tool = "MISSING_TOOL"
     unsafe_or_blocked = "UNSAFE_OR_BLOCKED"
 
@@ -30,6 +31,14 @@ def classify_request(user_message: str, planner: Planner | None = None) -> Reque
 
     if _looks_unsafe(normalized):
         return RequestClassification(RequestCategory.unsafe_or_blocked, "Request appears to ask for unsafe or destructive behavior.")
+
+    context_proposal = _context_tool_proposal(normalized)
+    if context_proposal is not None:
+        return RequestClassification(
+            RequestCategory.local_context,
+            "Request needs local context captured from the foreground/context window or clipboard.",
+            context_proposal,
+        )
 
     weather_proposal, missing_input = _weather_tool_proposal(user_message)
     if weather_proposal is not None or missing_input is not None:
@@ -57,6 +66,58 @@ def classify_request(user_message: str, planner: Planner | None = None) -> Reque
     return RequestClassification(RequestCategory.general_answer, "Request should be answered directly by the LLM.")
 
 
+def _context_tool_proposal(normalized: str) -> ToolProposal | None:
+    if _looks_like_selected_text_request(normalized):
+        return ToolProposal(name="get_selected_text", arguments={})
+
+    if any(phrase in normalized for phrase in ("foreground window", "technical foreground")):
+        return ToolProposal(name="get_foreground_window_info", arguments={})
+
+    if any(phrase in normalized for phrase in ("clipboard", "copied text", "copy buffer")):
+        return ToolProposal(name="get_clipboard_text", arguments={})
+
+    if any(
+        phrase in normalized
+        for phrase in (
+            "what app am i using",
+            "what app was i using",
+            "which app am i using",
+            "which app was i using",
+            "current window",
+            "this window",
+            "context window",
+            "previous window",
+        )
+    ):
+        return ToolProposal(name="get_context_window_info", arguments={})
+
+    return None
+
+
+def _looks_like_selected_text_request(normalized: str) -> bool:
+    if any(phrase in normalized for phrase in ("selected word", "selected text", "highlighted word", "highlighted text", "selection")):
+        return True
+
+    selected_verbs = (
+        "what did i select",
+        "what have i selected",
+        "what i selected",
+        "what do i have selected",
+        "what text do i have selected",
+        "what text did i select",
+        "what text have i selected",
+        "what text i have selected",
+        "what text i selected",
+        "what did i highlight",
+        "what have i highlighted",
+        "what i highlighted",
+    )
+    if any(phrase in normalized for phrase in selected_verbs):
+        return True
+
+    return bool(re.search(r"\b(selected|highlighted)\b.*\b(chrome|google|browser|page|window|app|text|word)\b", normalized))
+
+
 def _weather_tool_proposal(user_message: str) -> tuple[ToolProposal | None, str | None]:
     normalized = _normalize(user_message)
     if not _looks_like_weather_request(normalized):
@@ -81,21 +142,33 @@ def _extract_weather_date(normalized: str) -> str:
 
 
 def _extract_weather_location(user_message: str) -> str | None:
-    # Handles "weather today in Warsaw" and "weather in Warsaw today".
-    match = re.search(
-        r"\b(?:in|for|at)\s+([a-zA-Z][a-zA-Z\s.'-]*?)(?:\s+(?:today|tomorrow|on\s+\d{4}-\d{2}-\d{2}))?\??$",
-        user_message.strip(),
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        return None
+    # Pick the last plausible location preposition so "weather at 7pm in Warsaw" resolves to Warsaw.
+    text = user_message.strip()
+    candidates: list[str] = []
+    for match in re.finditer(r"\b(in|for|near|at)\s+", text, flags=re.IGNORECASE):
+        candidate = text[match.end():]
+        cleaned = _clean_weather_location_candidate(candidate)
+        if cleaned:
+            candidates.append(cleaned)
 
-    location = re.sub(r"\b(today|tomorrow)\b", "", match.group(1), flags=re.IGNORECASE).strip(" ?.,")
-    return location or None
+    return candidates[-1] if candidates else None
+
+
+def _clean_weather_location_candidate(candidate: str) -> str | None:
+    value = candidate.strip(" ?.,")
+    value = re.sub(r"\b(on\s+)?\d{4}-\d{2}-\d{2}\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(today|tomorrow|tonight|now|currently)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(this\s+)?(weekend|week|morning|afternoon|evening|night)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)?\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(weather|forecast|temperature|rain|raining)\b", "", value, flags=re.IGNORECASE)
+    value = " ".join(value.split()).strip(" ?.,")
+    if not value or value.lower() in {"the", "there", "outside", "today", "tomorrow"}:
+        return None
+    return value
 
 
 def _looks_like_weather_request(normalized: str) -> bool:
-    return any(keyword in normalized for keyword in ("weather", "forecast", "temperature", "rain today", "raining today"))
+    return any(keyword in normalized for keyword in ("weather", "forecast", "temperature", "rain", "raining"))
 
 
 def _looks_like_missing_capability(normalized: str) -> bool:

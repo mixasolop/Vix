@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.db.models import EventRecord, MessageRecord
+from app.db.models import ArtifactRecord, EventRecord, MessageRecord
 from app.schemas.events import AssistantEvent
 from app.schemas.proposed_tools import CreateProposedToolRequest, ProposedTool, ProposedToolStatus
 
@@ -128,6 +128,21 @@ class Database:
                 run_id TEXT,
                 source_type TEXT NOT NULL,
                 note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                run_id TEXT,
+                type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_text TEXT,
+                data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
@@ -309,10 +324,77 @@ class Database:
         ]
 
     def count_rows(self, table_name: str) -> int:
-        if table_name not in {"sessions", "messages", "events", "tool_calls", "permissions", "tools", "proposed_tools", "reflections"}:
+        if table_name not in {"sessions", "messages", "events", "tool_calls", "permissions", "tools", "proposed_tools", "reflections", "artifacts"}:
             raise ValueError(f"Unsupported table name: {table_name}")
         connection = self._ensure_connection()
         return int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+    def create_artifact(
+        self,
+        session_id: str | None,
+        run_id: str | None,
+        artifact_type: str,
+        title: str,
+        content_text: str | None,
+        data: dict[str, object],
+    ) -> ArtifactRecord:
+        if session_id is not None:
+            self.ensure_session(session_id)
+        artifact_id = f"artifact_{uuid4()}"
+        created_at = self._now_iso()
+        connection = self._ensure_connection()
+        connection.execute(
+            """
+            INSERT INTO artifacts (id, session_id, run_id, type, title, content_text, data_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                session_id,
+                run_id,
+                artifact_type,
+                title,
+                content_text,
+                json.dumps(data, sort_keys=True),
+                created_at,
+            ),
+        )
+        connection.commit()
+        return ArtifactRecord(
+            id=artifact_id,
+            session_id=session_id,
+            run_id=run_id,
+            type=artifact_type,
+            title=title,
+            content_text=content_text,
+            data_json=json.dumps(data, sort_keys=True),
+            created_at=AssistantEvent.parse_timestamp(created_at),
+        )
+
+    def list_artifacts(self, limit: int = 50) -> list[ArtifactRecord]:
+        connection = self._ensure_connection()
+        rows = connection.execute(
+            """
+            SELECT id, session_id, run_id, type, title, content_text, data_json, created_at
+            FROM artifacts
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            ArtifactRecord(
+                id=row[0],
+                session_id=row[1],
+                run_id=row[2],
+                type=row[3],
+                title=row[4],
+                content_text=row[5],
+                data_json=row[6],
+                created_at=AssistantEvent.parse_timestamp(row[7]),
+            )
+            for row in rows
+        ]
 
     def create_proposed_tool(
         self,

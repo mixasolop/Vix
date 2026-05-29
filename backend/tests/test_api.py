@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, date, datetime
 import logging
 from types import SimpleNamespace
 
@@ -7,14 +8,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+from app.assistant.request_classifier import RequestCategory, classify_request
 from app.assistant.llm_client import DeterministicLLMClient, OpenAILLMClient
 from app.assistant.planner import FALLBACK_MESSAGE, Planner
 from app.assistant.policy import PolicyEngine
 from app.config import AppConfig, load_config_from_file
+from app.context.window_tracker import WindowTracker
 from app.main import _build_llm_client, _get_ai_status, create_app
 from app.schemas.plans import AssistantPlan
 from app.schemas.proposed_tools import ProposedToolDraft
 from app.schemas.tools import ConfirmationPolicy, RiskLevel, ToolResult, ToolStatus
+from app.schemas.window_context import SelectedTextResult, WindowContextSnapshot, WindowInfo
+from app.tools import context_tools, weather_tools
+from app.tools.context_tools import build_context_tool_executors
 from app.tools.registry import build_default_registry
 
 
@@ -37,12 +43,70 @@ def client(tmp_path) -> Iterator[TestClient]:
         yield test_client
 
 
+def _window(
+    *,
+    hwnd: int,
+    title: str,
+    process_name: str,
+    is_vix: bool = False,
+) -> WindowInfo:
+    return WindowInfo(
+        hwnd=hwnd,
+        title=title,
+        process_id=1000 + hwnd,
+        process_name=process_name,
+        executable_path=f"C:\\Apps\\{process_name}",
+        is_vix=is_vix,
+        captured_at=datetime.now(UTC),
+    )
+
+
+class FakeWindowTracker:
+    def __init__(self, current: WindowInfo | None = None, context: WindowInfo | None = None) -> None:
+        self.current = current
+        self.context = context
+        self.callback = None
+
+    def set_context_updated_callback(self, callback) -> None:
+        self.callback = callback
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def get_current_foreground_window(self, refresh: bool = True) -> WindowInfo | None:
+        return self.current
+
+    def get_context_window(self, validate_exists: bool = False) -> WindowInfo | None:
+        return self.context
+
+    def snapshot(self) -> WindowContextSnapshot:
+        return WindowContextSnapshot(
+            current_foreground_window=self.current,
+            last_non_vix_window=self.context,
+            last_context_window=self.context,
+            last_context_captured_at=self.context.captured_at if self.context else None,
+        )
+
+
+class FakeSelectedTextStrategy:
+    async def capture(self, target: WindowInfo) -> SelectedTextResult:
+        return SelectedTextResult(
+            status="success",
+            text="recursion",
+            context_window=target,
+            restored_clipboard=True,
+        )
+
+
 def test_health(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["stage"] == "3.0"
+    assert response.json()["stage"] == "4.0"
 
 
 def test_sqlite_runtime_pragmas_and_tools_table(client: TestClient) -> None:
@@ -61,6 +125,10 @@ def test_tools_endpoint_lists_stage_one_contracts(client: TestClient) -> None:
     assert tools["launch_app"]["status"] == "implemented"
     assert tools["get_current_time"]["status"] == "implemented"
     assert tools["get_weather"]["status"] == "implemented"
+    assert tools["get_foreground_window_info"]["status"] == "implemented"
+    assert tools["get_context_window_info"]["status"] == "implemented"
+    assert tools["get_clipboard_text"]["status"] == "implemented"
+    assert tools["get_selected_text"]["status"] == "implemented"
     assert tools["list_available_tools"]["status"] == "implemented"
     assert tools["create_file"]["risk_level"] == "MEDIUM_WRITE"
     assert tools["send_message"]["risk_level"] == "HIGH_RISK"
@@ -85,6 +153,14 @@ def test_chat_returns_acceptance_only(client: TestClient) -> None:
     [
         ("open notepad", "launch_app", {"app_name": "notepad"}),
         ("launch calculator", "launch_app", {"app_name": "calculator"}),
+        ("please run calculator", "launch_app", {"app_name": "calculator"}),
+        ("yes, open calculator", "launch_app", {"app_name": "calculator"}),
+        ("run calculator please", "launch_app", {"app_name": "calculator"}),
+        (
+            "please open the thing used for calculating things, named calculator",
+            "launch_app",
+            {"app_name": "calculator"},
+        ),
         ("start paint", "launch_app", {"app_name": "paint"}),
         ("open file explorer", "launch_app", {"app_name": "explorer"}),
         ("what tools do you have", "list_available_tools", {}),
@@ -334,8 +410,14 @@ def test_ai_status_endpoint_reports_missing_key_when_general_answers_enabled(cli
     assert body["model"] == "gpt-5.4-mini"
     assert body["general_answers_enabled"] is True
     assert body["proposals_enabled"] is False
+    assert body["api_key_configured"] is False
+    assert body["model_reachable"] is False
     assert body["connected"] is False
     assert body["status"] == "missing_api_key"
+    assert body["general_answers_status"] == "missing_api_key"
+    assert body["tool_proposals_status"] == "disabled"
+    assert body["api_key_status"] == "missing"
+    assert body["model_status"] == "not_checked"
 
 
 def test_ai_status_reports_disabled_when_all_ai_capabilities_are_disabled() -> None:
@@ -347,6 +429,8 @@ def test_ai_status_reports_disabled_when_all_ai_capabilities_are_disabled() -> N
     assert status.status == "disabled"
     assert status.general_answers_enabled is False
     assert status.proposals_enabled is False
+    assert status.api_key_status == "configured"
+    assert status.model_status == "not_checked"
 
 
 def test_ai_status_reloads_private_config_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -394,8 +478,13 @@ def test_ai_status_reloads_private_config_file(tmp_path, monkeypatch: pytest.Mon
     body = response.json()
     assert body["proposals_enabled"] is True
     assert body["api_key_configured"] is True
+    assert body["model_reachable"] is True
     assert body["connected"] is True
     assert body["status"] == "connected"
+    assert body["general_answers_status"] == "enabled"
+    assert body["tool_proposals_status"] == "enabled"
+    assert body["api_key_status"] == "configured"
+    assert body["model_status"] == "reachable"
     assert body["detail"] == "fake OpenAI verification"
 
 
@@ -406,6 +495,10 @@ def test_ai_status_reports_missing_api_key_when_enabled() -> None:
 
     assert status.connected is False
     assert status.status == "missing_api_key"
+    assert status.general_answers_status == "missing_api_key"
+    assert status.tool_proposals_status == "missing_api_key"
+    assert status.api_key_status == "missing"
+    assert status.model_status == "not_checked"
     assert status.detail == "OPENAI_API_KEY is not configured in backend/.env."
 
 
@@ -419,7 +512,11 @@ def test_ai_status_verifies_configured_model() -> None:
     status = asyncio.run(_get_ai_status(config, FakeLLMClient()))
 
     assert status.connected is True
+    assert status.model_reachable is True
     assert status.status == "connected"
+    assert status.general_answers_status == "enabled"
+    assert status.tool_proposals_status == "enabled"
+    assert status.model_status == "reachable"
     assert status.detail == "verified"
 
 
@@ -438,7 +535,11 @@ def test_ai_status_timeout_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     status = asyncio.run(_get_ai_status(config, SlowLLMClient()))
 
     assert status.connected is False
+    assert status.model_reachable is False
     assert status.status == "verification_failed"
+    assert status.general_answers_status == "model_unreachable"
+    assert status.tool_proposals_status == "model_unreachable"
+    assert status.model_status == "unreachable"
     assert status.detail == "OpenAI model verification timed out after 8 seconds."
 
 
@@ -569,7 +670,16 @@ def test_permission_required_event_contains_structured_preview(tmp_path) -> None
     assert app.state.database.count_rows("permissions") == 1
 
 
-def test_open_calculator_uses_local_tool_not_llm(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "message",
+    [
+        "open calculator",
+        "please run calculator",
+        "yes, open calculator",
+        "please open the thing used for calculating things, named calculator",
+    ],
+)
+def test_calculator_launch_requests_use_local_tool_not_llm(tmp_path, message: str) -> None:
     class FailingLLMClient:
         async def complete(self, messages: list[dict[str, object]]) -> str:
             raise AssertionError("LLM complete should not be called for local tools.")
@@ -602,7 +712,7 @@ def test_open_calculator_uses_local_tool_not_llm(tmp_path) -> None:
         with test_client.websocket_connect("/ws/events") as websocket:
             assert websocket.receive_json()["type"] == "event_stream_connected"
 
-            response = test_client.post("/chat", json={"message": "open calculator"})
+            response = test_client.post("/chat", json={"message": message})
             assert response.status_code == 200
 
             events = [websocket.receive_json() for _ in range(8)]
@@ -642,6 +752,242 @@ def test_weather_today_without_location_asks_for_city(client: TestClient) -> Non
     assert events[2]["data"]["missing_input"] == "location"
     assert events[-1]["data"]["message"] == "Which city should I check?"
     assert client.app.state.database.count_rows("tool_calls") == 0
+
+
+@pytest.mark.parametrize(
+    ("message", "location", "requested_date"),
+    [
+        ("what's the weather in New York tomorrow?", "New York", "tomorrow"),
+        ("weather in Bielsko-Biała", "Bielsko-Biała", "today"),
+        ("weather in São Paulo", "São Paulo", "today"),
+        ("weather at 7pm in Warsaw", "Warsaw", "today"),
+        ("will it rain in Warsaw this weekend?", "Warsaw", "today"),
+    ],
+)
+def test_weather_classifier_extracts_multiword_and_unicode_locations(
+    message: str,
+    location: str,
+    requested_date: str,
+) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.realtime_info
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_weather"
+    assert classification.tool_proposal.arguments == {"location": location, "date": requested_date}
+
+
+@pytest.mark.parametrize("message", ["weather at 7pm", "will it rain this weekend?"])
+def test_weather_classifier_asks_for_location_when_ambiguous(message: str) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.realtime_info
+    assert classification.tool_proposal is None
+    assert classification.missing_input == "location"
+
+
+def test_vix_window_is_ignored_by_tracker() -> None:
+    tracker = WindowTracker()
+    vscode = _window(hwnd=101, title="main.py - Visual Studio Code", process_name="Code.exe")
+    vix = _window(hwnd=202, title="Desktop Assistant", process_name="DesktopAssistant.Frontend.exe", is_vix=True)
+
+    tracker.on_foreground_window_changed(vscode)
+    tracker.on_foreground_window_changed(vix)
+
+    assert tracker.get_current_foreground_window(refresh=False) == vix
+    assert tracker.get_context_window(validate_exists=False) == vscode
+    assert tracker.snapshot().last_non_vix_window == vscode
+
+
+def test_last_non_vix_window_is_preserved_when_vix_gets_focus() -> None:
+    tracker = WindowTracker()
+    chrome = _window(hwnd=303, title="Article - Google Chrome", process_name="chrome.exe")
+    vix = _window(hwnd=404, title="Desktop Assistant", process_name="DesktopAssistant.Frontend.exe", is_vix=True)
+
+    tracker.on_foreground_window_changed(chrome)
+    tracker.on_foreground_window_changed(vix)
+
+    assert tracker.get_context_window(validate_exists=False).title == "Article - Google Chrome"
+    assert tracker.get_current_foreground_window(refresh=False).is_vix is True
+
+
+def test_context_window_fallback_does_not_overwrite_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracker = WindowTracker()
+    vix = _window(hwnd=405, title="Desktop Assistant", process_name="DesktopAssistant.Frontend.exe", is_vix=True)
+    chrome = _window(hwnd=406, title="asd - Google Search - Google Chrome", process_name="chrome.exe")
+    tracker.on_foreground_window_changed(vix)
+    monkeypatch.setattr(tracker, "_find_fallback_context_window", lambda: chrome)
+
+    context = tracker.get_context_window(validate_exists=False)
+
+    assert context == chrome
+    assert tracker.get_current_foreground_window(refresh=False) == vix
+
+
+def test_get_context_window_returns_last_non_vix_window() -> None:
+    vscode = _window(hwnd=505, title="main.py - Visual Studio Code", process_name="Code.exe")
+    executors = build_context_tool_executors(FakeWindowTracker(context=vscode))
+
+    result = asyncio.run(executors["get_context_window_info"]({}))
+
+    assert result.status == "success"
+    assert result.output["window"]["title"] == "main.py - Visual Studio Code"
+    assert result.output["source"] == "context_window"
+
+
+def test_get_foreground_window_can_return_vix() -> None:
+    vix = _window(hwnd=606, title="Desktop Assistant", process_name="DesktopAssistant.Frontend.exe", is_vix=True)
+    executors = build_context_tool_executors(FakeWindowTracker(current=vix))
+
+    result = asyncio.run(executors["get_foreground_window_info"]({}))
+
+    assert result.status == "success"
+    assert result.output["window"]["is_vix"] is True
+    assert result.output["source"] == "foreground_window"
+
+
+def test_get_selected_text_fails_if_no_context_window() -> None:
+    executors = build_context_tool_executors(FakeWindowTracker())
+
+    result = asyncio.run(executors["get_selected_text"]({}))
+
+    assert result.status == "failed"
+    assert result.error == "No previous non-Vix window was captured."
+
+
+def test_get_clipboard_text_handles_empty_clipboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        context_tools,
+        "_try_read_clipboard_text",
+        lambda: context_tools._ClipboardReadResult(False, error="Clipboard does not contain text."),
+    )
+    executors = build_context_tool_executors(FakeWindowTracker())
+
+    result = asyncio.run(executors["get_clipboard_text"]({}))
+
+    assert result.status == "failed"
+    assert result.error == "Clipboard does not contain text."
+
+
+def test_get_clipboard_text_handles_access_violation_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_access_violation():
+        raise OSError("exception: access violation reading 0xFFFFFFFF9D35EC10")
+
+    monkeypatch.setattr(context_tools, "_try_read_clipboard_text", raise_access_violation)
+    executors = build_context_tool_executors(FakeWindowTracker())
+
+    result = asyncio.run(executors["get_clipboard_text"]({}))
+
+    assert result.status == "failed"
+    assert "access violation" in result.error
+
+
+def test_classifier_selected_text_routes_to_local_context() -> None:
+    classification = classify_request("What does selected word mean?")
+
+    assert classification.category == RequestCategory.local_context
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_selected_text"
+
+
+def test_classifier_selected_in_google_routes_to_local_context() -> None:
+    classification = classify_request("what text did i select in google?")
+
+    assert classification.category == RequestCategory.local_context
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_selected_text"
+
+
+def test_classifier_selected_in_foreground_window_routes_to_selected_text() -> None:
+    classification = classify_request("what text do i have selected in foreground window?")
+
+    assert classification.category == RequestCategory.local_context
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_selected_text"
+
+
+def test_classifier_selected_ungrammatical_phrase_routes_to_selected_text() -> None:
+    classification = classify_request("what text i have selected")
+
+    assert classification.category == RequestCategory.local_context
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_selected_text"
+
+
+def test_classifier_current_window_uses_context_window_not_foreground_window() -> None:
+    classification = classify_request("What app was I using?")
+
+    assert classification.category == RequestCategory.local_context
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_context_window_info"
+
+
+def test_get_weather_output_includes_scientific_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    today = date.today().isoformat()
+
+    def fake_get_json(url: str, params: dict[str, object]) -> tuple[dict[str, object], str]:
+        if url == weather_tools.GEOCODING_URL:
+            return (
+                {
+                    "generationtime_ms": 0.23,
+                    "results": [
+                        {
+                            "name": "Warsaw",
+                            "admin1": "Masovian Voivodeship",
+                            "country": "Poland",
+                            "latitude": 52.23,
+                            "longitude": 21.01,
+                        },
+                        {
+                            "name": "Warsaw",
+                            "admin1": "Indiana",
+                            "country": "United States",
+                            "latitude": 41.24,
+                            "longitude": -85.85,
+                        },
+                    ],
+                },
+                "https://geocoding-api.open-meteo.com/v1/search?name=Warsaw&count=5",
+            )
+
+        assert url == weather_tools.FORECAST_URL
+        return (
+            {
+                "generationtime_ms": 0.78,
+                "timezone": "Europe/Warsaw",
+                "current": {"temperature_2m": 20.5, "wind_speed_10m": 8.0},
+                "daily": {
+                    "time": [today],
+                    "weather_code": [0],
+                    "temperature_2m_max": [24.0],
+                    "temperature_2m_min": [15.0],
+                    "precipitation_probability_max": [10],
+                    "wind_speed_10m_max": [18.0],
+                },
+            },
+            "https://api.open-meteo.com/v1/forecast?latitude=52.23&longitude=21.01",
+        )
+
+    monkeypatch.setattr(weather_tools, "_get_json", fake_get_json)
+
+    result = weather_tools._get_weather_sync("Warsaw", "today")
+
+    assert result.status == "success"
+    output = result.output
+    assert output["source"] == "Open-Meteo"
+    assert output["source_urls"]["geocoding"].startswith("https://geocoding-api.open-meteo.com")
+    assert output["source_urls"]["forecast"].startswith("https://api.open-meteo.com")
+    assert output["resolved_coordinates"] == {"latitude": 52.23, "longitude": 21.01}
+    assert output["timezone"] == "Europe/Warsaw"
+    assert output["units"] == {
+        "temperature": "celsius",
+        "wind_speed": "km/h",
+        "precipitation_probability": "percent",
+    }
+    assert output["forecast_generation_time_ms"] == 0.78
+    assert output["geocoding"]["candidate_count"] == 2
+    assert output["geocoding"]["is_ambiguous"] is True
+    assert output["geocoding"]["selected_name"] == "Warsaw, Masovian Voivodeship, Poland"
 
 
 def test_weather_today_in_warsaw_calls_get_weather(tmp_path) -> None:
@@ -725,6 +1071,28 @@ def test_llm_failure_returns_graceful_assistant_error(tmp_path) -> None:
     ]
     assert events[5]["data"]["status"] == "failed"
     assert events[-1]["data"]["message"] == "I could not get an AI answer right now. Please try again."
+
+
+def test_unsafe_request_is_blocked(client: TestClient) -> None:
+    with client.websocket_connect("/ws/events") as websocket:
+        assert websocket.receive_json()["type"] == "event_stream_connected"
+
+        response = client.post("/chat", json={"message": "delete system32"})
+        assert response.status_code == 200
+
+        events = [websocket.receive_json() for _ in range(6)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "error_occurred",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "UNSAFE_OR_BLOCKED"
+    assert events[-1]["data"]["message"] == "Request appears to ask for unsafe or destructive behavior."
+    assert client.app.state.database.count_rows("tool_calls") == 0
 
 
 def test_unknown_chat_request_without_missing_capability_uses_llm_fallback(client: TestClient) -> None:
@@ -1002,6 +1370,89 @@ def test_llm_tool_proposal_is_persisted_without_execution(tmp_path) -> None:
     assert events[4]["data"]["name"] == "summarize_documents"
     assert app.state.database.count_rows("tool_calls") == 0
     assert app.state.database.count_rows("proposed_tools") == 1
+
+
+def test_selected_text_request_captures_artifact_and_uses_llm_context(tmp_path) -> None:
+    class CapturingLLMClient:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            self.messages = messages
+            return "Recursion is when a definition or function refers back to itself."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Local context requests should not create proposed tools.")
+
+    context_window = _window(hwnd=707, title="notes.txt - Notepad", process_name="notepad.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(tracker, FakeSelectedTextStrategy())
+    llm_client = CapturingLLMClient()
+    app = create_app(
+        database_path=tmp_path / "selected-text.sqlite3",
+        registry=registry,
+        llm_client=llm_client,
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "What does selected word mean?"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(13)]
+
+        context_response = test_client.get("/context/status")
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "context_window_selected",
+        "tool_selected",
+        "tool_started",
+        "tool_result",
+        "context_captured",
+        "artifact_created",
+        "llm_response_started",
+        "llm_response_finished",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "LOCAL_CONTEXT"
+    assert events[5]["data"]["tool_name"] == "get_selected_text"
+    assert events[8]["data"]["artifact_type"] == "selected_text"
+    assert events[8]["data"]["content_preview"] == "recursion"
+    assert events[9]["data"]["artifact"]["type"] == "selected_text"
+    assert events[9]["data"]["artifact"]["content_text"] == "recursion"
+    assert "recursion" in llm_client.messages[-1]["content"]
+    assert context_response.status_code == 200
+    assert context_response.json()["last_context_artifact"]["content_text"] == "recursion"
+    assert app.state.database.count_rows("artifacts") == 1
+    assert app.state.database.count_rows("tool_calls") == 1
+
+
+def test_context_status_endpoint_returns_tracker_snapshot(tmp_path) -> None:
+    context_window = _window(hwnd=808, title="main.py - Visual Studio Code", process_name="Code.exe")
+    foreground = _window(hwnd=909, title="Desktop Assistant", process_name="DesktopAssistant.Frontend.exe", is_vix=True)
+    tracker = FakeWindowTracker(current=foreground, context=context_window)
+    app = create_app(database_path=tmp_path / "context-status.sqlite3", config=AppConfig(), context_tracker=tracker)
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/context/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_foreground_window"]["is_vix"] is True
+    assert body["last_context_window"]["process_name"] == "Code.exe"
+    assert body["last_context_artifact"] is None
 
 
 def test_chat_persists_trace_tables_from_run_events(client: TestClient) -> None:

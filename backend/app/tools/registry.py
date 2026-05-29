@@ -5,7 +5,9 @@ import json
 import logging
 from typing import Any
 
+from app.context.window_tracker import WindowTracker
 from app.schemas.tools import ConfirmationPolicy, RetryPolicy, RiskLevel, ToolDefinition, ToolResult, ToolStatus
+from app.tools.context_tools import SelectedTextCaptureStrategy, build_context_tool_executors
 from app.tools.system_tools import get_current_time, launch_app
 from app.tools.weather_tools import get_weather
 
@@ -77,6 +79,10 @@ class ToolRegistry:
             except TimeoutError:
                 last_result = ToolResult(tool=name, status="failed", error=f"Tool timed out after {metadata.timeout_seconds} seconds.")
                 LOGGER.warning("tool attempt timed out | name=%s | attempt=%s | timeout_seconds=%s", name, attempt, metadata.timeout_seconds)
+            except Exception as exc:
+                last_result = ToolResult(tool=name, status="failed", error=f"Tool raised an exception: {exc}")
+                LOGGER.exception("tool attempt raised exception | name=%s | attempt=%s", name, attempt)
+                return last_result
 
             if metadata.retry_policy.backoff_seconds > 0:
                 await asyncio.sleep(metadata.retry_policy.backoff_seconds)
@@ -117,9 +123,14 @@ class ToolRegistry:
         return None
 
 
-def build_default_registry() -> ToolRegistry:
+def build_default_registry(
+    window_tracker: WindowTracker | None = None,
+    selected_text_strategy: SelectedTextCaptureStrategy | None = None,
+) -> ToolRegistry:
     registry = ToolRegistry()
-    for definition, executor in _default_tool_runtimes():
+    window_tracker = window_tracker or WindowTracker()
+    context_executors = build_context_tool_executors(window_tracker, selected_text_strategy)
+    for definition, executor in _default_tool_runtimes(context_executors):
         registry.register(definition, executor)
     registry.register(_list_available_tools_definition(), _build_list_available_tools_executor(registry))
     return registry
@@ -179,15 +190,78 @@ def _weather_output_schema() -> dict[str, Any]:
             "precipitation_probability": {"type": "number"},
             "wind": {"type": "object"},
             "source": {"type": "string"},
+            "source_urls": {"type": "object"},
+            "resolved_coordinates": {"type": "object"},
+            "timezone": {"type": "string"},
+            "units": {"type": "object"},
+            "forecast_generation_time_ms": {"type": "number"},
+            "geocoding": {"type": "object"},
         },
-        ["status", "message", "location", "temperature", "condition", "precipitation_probability", "wind", "source"],
+        [
+            "status",
+            "message",
+            "location",
+            "temperature",
+            "condition",
+            "precipitation_probability",
+            "wind",
+            "source",
+            "source_urls",
+            "resolved_coordinates",
+            "timezone",
+            "units",
+            "geocoding",
+        ],
+    )
+
+
+def _window_info_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "window": {"type": "object"},
+            "source": {"type": "string"},
+        },
+        ["status", "message", "window", "source"],
+    )
+
+
+def _clipboard_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "text": {"type": "string"},
+            "length": {"type": "number"},
+            "source": {"type": "string"},
+            "captured_at": {"type": "string"},
+        },
+        ["status", "message", "text", "length", "source", "captured_at"],
+    )
+
+
+def _selected_text_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "text": {"type": "string"},
+            "length": {"type": "number"},
+            "method": {"type": "string"},
+            "context_window": {"type": "object"},
+            "restored_clipboard": {"type": "boolean"},
+            "metadata": {"type": "object"},
+            "captured_at": {"type": "string"},
+        },
+        ["status", "message", "text", "length", "method", "context_window", "restored_clipboard"],
     )
 
 
 def _list_available_tools_definition() -> ToolDefinition:
     return ToolDefinition(
         name="list_available_tools",
-        description="List registered assistant tools and their Stage 1 status.",
+        description="List registered assistant tools and their implementation status.",
         status=ToolStatus.implemented,
         input_schema=_object_schema({}),
         output_schema=_list_available_tools_output_schema(),
@@ -224,7 +298,7 @@ def _build_list_available_tools_executor(registry: ToolRegistry) -> ToolExecutor
     return list_available_tools
 
 
-def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]:
+def _default_tool_runtimes(context_executors: dict[str, ToolExecutor]) -> list[tuple[ToolDefinition, ToolExecutor | None]]:
     return [
         (
             ToolDefinition(
@@ -273,6 +347,62 @@ def _default_tool_runtimes() -> list[tuple[ToolDefinition, ToolExecutor | None]]
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
             get_weather,
+        ),
+        (
+            ToolDefinition(
+                name="get_foreground_window_info",
+                description="Return the actual current foreground window, even if it is Vix.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_window_info_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=5,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            context_executors["get_foreground_window_info"],
+        ),
+        (
+            ToolDefinition(
+                name="get_context_window_info",
+                description="Return the last non-Vix context window for user-perspective references like this window or current app.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_window_info_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=5,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            context_executors["get_context_window_info"],
+        ),
+        (
+            ToolDefinition(
+                name="get_clipboard_text",
+                description="Read the current text clipboard. Privacy-sensitive read.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_clipboard_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=5,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            context_executors["get_clipboard_text"],
+        ),
+        (
+            ToolDefinition(
+                name="get_selected_text",
+                description="Capture selected text from the context window using temporary focus and Ctrl+C. Privacy-sensitive read.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_selected_text_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=8,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            context_executors["get_selected_text"],
         ),
         (
             ToolDefinition(

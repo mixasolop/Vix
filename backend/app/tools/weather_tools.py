@@ -52,8 +52,10 @@ async def get_weather(arguments: dict[str, object]) -> ToolResult:
 
 def _get_weather_sync(location: str, requested_date: str) -> ToolResult:
     target_date = _resolve_requested_date(requested_date)
-    place = _geocode(location)
-    forecast = _forecast(place["latitude"], place["longitude"], target_date)
+    geocoding_result = _geocode(location)
+    place = geocoding_result["place"]
+    forecast_result = _forecast(place["latitude"], place["longitude"], target_date)
+    forecast = forecast_result["payload"]
     daily = forecast["daily"]
     index = daily["time"].index(target_date.isoformat())
 
@@ -96,6 +98,29 @@ def _get_weather_sync(location: str, requested_date: str) -> ToolResult:
             "precipitation_probability": precipitation_probability,
             "wind": wind,
             "source": "Open-Meteo",
+            "source_urls": {
+                "geocoding": geocoding_result["url"],
+                "forecast": forecast_result["url"],
+            },
+            "resolved_coordinates": {
+                "latitude": place["latitude"],
+                "longitude": place["longitude"],
+            },
+            "timezone": forecast.get("timezone"),
+            "units": {
+                "temperature": "celsius",
+                "wind_speed": "km/h",
+                "precipitation_probability": "percent",
+            },
+            "forecast_generation_time_ms": forecast.get("generationtime_ms"),
+            "geocoding": {
+                "candidate_count": geocoding_result["candidate_count"],
+                "is_ambiguous": geocoding_result["candidate_count"] > 1,
+                "selected_rank": 1,
+                "selected_name": resolved_location,
+                "candidates": geocoding_result["candidates"],
+                "generation_time_ms": geocoding_result["generation_time_ms"],
+            },
         },
     )
 
@@ -109,11 +134,11 @@ def _resolve_requested_date(requested_date: str) -> date:
 
 
 def _geocode(location: str) -> dict[str, object]:
-    payload = _get_json(
+    payload, url = _get_json(
         GEOCODING_URL,
         {
             "name": location,
-            "count": 1,
+            "count": 5,
             "language": "en",
             "format": "json",
         },
@@ -121,12 +146,26 @@ def _geocode(location: str) -> dict[str, object]:
     results = payload.get("results") or []
     if not results:
         raise ValueError(f"Location was not found: {location}")
-    return results[0]
+    candidates = [
+        {
+            "name": _resolved_location_name(result),
+            "latitude": result.get("latitude"),
+            "longitude": result.get("longitude"),
+        }
+        for result in results[:5]
+    ]
+    return {
+        "place": results[0],
+        "url": url,
+        "candidate_count": len(results),
+        "candidates": candidates,
+        "generation_time_ms": payload.get("generationtime_ms"),
+    }
 
 
 def _forecast(latitude: object, longitude: object, target_date: date) -> dict[str, object]:
     days_ahead = max((target_date - date.today()).days + 1, 1)
-    payload = _get_json(
+    payload, url = _get_json(
         FORECAST_URL,
         {
             "latitude": latitude,
@@ -140,10 +179,18 @@ def _forecast(latitude: object, longitude: object, target_date: date) -> dict[st
     daily = payload.get("daily") or {}
     if target_date.isoformat() not in daily.get("time", []):
         raise ValueError(f"Forecast date is not available: {target_date.isoformat()}")
-    return payload
+    return {"payload": payload, "url": url}
 
 
-def _get_json(url: str, params: dict[str, object]) -> dict[str, object]:
+def _get_json(url: str, params: dict[str, object]) -> tuple[dict[str, object], str]:
     full_url = f"{url}?{urlencode(params)}"
     with urlopen(full_url, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return json.loads(response.read().decode("utf-8")), full_url
+
+
+def _resolved_location_name(place: dict[str, object]) -> str:
+    return ", ".join(
+        str(part)
+        for part in (place.get("name"), place.get("admin1"), place.get("country"))
+        if part
+    )

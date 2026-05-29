@@ -258,6 +258,28 @@
                 </Grid>
             </TabItem>
 
+            <TabItem Header="Context">
+                <Grid Margin="0,14,0,0">
+                    <Border Style="{StaticResource PanelBorderStyle}">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Local Context" Style="{StaticResource PanelTitleStyle}" />
+                            <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
+                                <StackPanel MaxWidth="840" HorizontalAlignment="Left">
+                                    <TextBlock Text="Vix tracks the last non-Vix window separately from the technical foreground window, so selected-text commands target the app you were using before opening Vix."
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Margin="0,0,0,18" />
+                                    <ItemsControl ItemsSource="{Binding ContextStatus}" ItemTemplate="{StaticResource StatusItemTemplate}" />
+                                </StackPanel>
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+
             <TabItem Header="Developer">
                 <Grid Margin="0,14,0,0">
                     <Grid.RowDefinitions>
