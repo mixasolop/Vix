@@ -36,6 +36,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private WindowInfoDto? _currentForegroundWindow;
     private WindowInfoDto? _lastContextWindow;
     private Dictionary<string, object?>? _lastContextArtifact;
+    private string _browserCurrentUrl = "No browser page open";
+    private string _browserPageTitle = "No page title";
+    private string _browserTextPreview = "Open a URL with Vix to capture a browser snapshot.";
+    private Dictionary<string, object?>? _lastBrowserArtifact;
+    private string _lastBrowserAction = "No browser action yet";
+    private string _browserRiskClassification = "Unknown";
     private string _draftInput = string.Empty;
     private string _goalTitle = "No active plan";
     private string _toolTracePlaceholder = "No tool calls yet";
@@ -63,6 +69,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         FailedToolCalls.Add("No failed tool calls");
         PermissionHistory.Add("No permission history yet");
         RefreshContextPanel();
+        RefreshBrowserPanel();
 
         RefreshSettings();
     }
@@ -149,6 +156,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public ObservableCollection<StatusItem> ContextStatus { get; } = [];
 
+    public ObservableCollection<StatusItem> BrowserStatus { get; } = [];
+
     public async Task InitializeAsync()
     {
         SetBackendStatus("Starting", "Checking local backend health.");
@@ -171,6 +180,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             await LoadRegisteredToolsAsync(_shutdown.Token);
             await LoadProposedToolsAsync(_shutdown.Token);
             await LoadContextStatusAsync(_shutdown.Token);
+            await LoadBrowserStatusAsync(_shutdown.Token);
             _isReady = true;
             SendCommand.RaiseCanExecuteChanged();
         }
@@ -381,6 +391,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                     resultArguments,
                     resultStatus);
                 AddRecentToolCall(resultToolName, resultArguments, resultStatus);
+                break;
+
+            case "llm_response_started":
+            case "llm_response_finished":
+                ApplyPlanIfPresent(assistantEvent.Data);
                 break;
 
             case "permission_required":
@@ -669,6 +684,22 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         return $"Preview: {preview}; Method: {method}; Clipboard restored: {restoredClipboard}.";
     }
 
+    private static string FormatBrowserArtifactDetail(Dictionary<string, object?>? artifact)
+    {
+        if (artifact is null || artifact.Count == 0)
+        {
+            return "Open or read a page to create browser artifacts.";
+        }
+
+        var content = GetPreviewString(artifact, "content_text", string.Empty);
+        var data = GetObjectMap(artifact, "data");
+        var result = GetObjectMap(data, "result");
+        var url = GetPreviewString(result, "url", "unknown URL");
+        var risk = GetPreviewString(data, "risk_level", "unknown risk");
+        var preview = string.IsNullOrWhiteSpace(content) ? "no text preview" : $"\"{TrimPreview(content, 180)}\"";
+        return $"URL: {url}; Risk: {risk}; Preview: {preview}.";
+    }
+
     private static string TrimPreview(string value, int maxLength)
     {
         if (value.Length <= maxLength)
@@ -784,6 +815,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         RefreshContextPanel();
     }
 
+    private async Task LoadBrowserStatusAsync(CancellationToken cancellationToken)
+    {
+        var browserStatus = await _backendHttpClient.GetBrowserStatusAsync(cancellationToken);
+        _browserCurrentUrl = string.IsNullOrWhiteSpace(browserStatus.CurrentUrl) ? "No browser page open" : browserStatus.CurrentUrl;
+        _browserPageTitle = string.IsNullOrWhiteSpace(browserStatus.PageTitle) ? "No page title" : browserStatus.PageTitle;
+        _browserTextPreview = string.IsNullOrWhiteSpace(browserStatus.TextPreview)
+            ? "Open a URL with Vix to capture a browser snapshot."
+            : TrimPreview(browserStatus.TextPreview, 420);
+        _lastBrowserArtifact = browserStatus.LastBrowserArtifact;
+        _lastBrowserAction = string.IsNullOrWhiteSpace(browserStatus.LastBrowserAction) ? "No browser action yet" : browserStatus.LastBrowserAction;
+        _browserRiskClassification = string.IsNullOrWhiteSpace(browserStatus.RiskClassification) ? "Unknown" : browserStatus.RiskClassification;
+        RefreshBrowserPanel();
+    }
+
     private void AddPermissionHistory(Dictionary<string, object?> data, string status)
     {
         var permissionId = GetString(data, "permission_id");
@@ -885,8 +930,29 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
+        var type = GetPreviewString(artifact, "type", string.Empty);
+        if (type.StartsWith("browser_", StringComparison.OrdinalIgnoreCase) || string.Equals(type, "form_draft", StringComparison.OrdinalIgnoreCase))
+        {
+            ApplyBrowserArtifact(artifact);
+            return;
+        }
+
         _lastContextArtifact = artifact;
         RefreshContextPanel();
+    }
+
+    private void ApplyBrowserArtifact(Dictionary<string, object?> artifact)
+    {
+        _lastBrowserArtifact = artifact;
+        var data = GetObjectMap(artifact, "data");
+        var result = GetObjectMap(data, "result");
+        var snapshot = GetObjectMap(result, "snapshot");
+        _browserCurrentUrl = GetPreviewString(snapshot, "url", GetPreviewString(result, "url", _browserCurrentUrl));
+        _browserPageTitle = GetPreviewString(snapshot, "title", GetPreviewString(result, "title", _browserPageTitle));
+        _browserTextPreview = TrimPreview(GetPreviewString(snapshot, "text_preview", GetPreviewString(result, "text_preview", _browserTextPreview)), 420);
+        _lastBrowserAction = GetPreviewString(data, "tool", GetPreviewString(artifact, "type", _lastBrowserAction));
+        _browserRiskClassification = GetPreviewString(data, "risk_level", _browserRiskClassification);
+        RefreshBrowserPanel();
     }
 
     private void RefreshContextPanel()
@@ -909,6 +975,41 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             Label = "Last context",
             Value = FormatArtifactValue(_lastContextArtifact),
             Detail = FormatArtifactDetail(_lastContextArtifact),
+        });
+    }
+
+    private void RefreshBrowserPanel()
+    {
+        BrowserStatus.Clear();
+        BrowserStatus.Add(new StatusItem
+        {
+            Label = "Current URL",
+            Value = _browserCurrentUrl,
+            Detail = "The URL loaded in Vix's isolated controlled browser session.",
+        });
+        BrowserStatus.Add(new StatusItem
+        {
+            Label = "Page title",
+            Value = _browserPageTitle,
+            Detail = "Title from the latest browser page snapshot.",
+        });
+        BrowserStatus.Add(new StatusItem
+        {
+            Label = "Page preview",
+            Value = _browserTextPreview,
+            Detail = "Text preview captured as a browser artifact.",
+        });
+        BrowserStatus.Add(new StatusItem
+        {
+            Label = "Last browser artifact",
+            Value = FormatArtifactValue(_lastBrowserArtifact),
+            Detail = FormatBrowserArtifactDetail(_lastBrowserArtifact),
+        });
+        BrowserStatus.Add(new StatusItem
+        {
+            Label = "Last browser action",
+            Value = _lastBrowserAction,
+            Detail = $"Risk classification: {_browserRiskClassification}. Submit/book/order/pay actions require permission.",
         });
     }
 

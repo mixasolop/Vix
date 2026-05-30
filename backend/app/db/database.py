@@ -1,10 +1,10 @@
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from app.db.models import ArtifactRecord, EventRecord, MessageRecord
+from app.db.models import ArtifactRecord, ClarificationRecord, EventRecord, MessageRecord
 from app.schemas.events import AssistantEvent
 from app.schemas.proposed_tools import CreateProposedToolRequest, ProposedTool, ProposedToolStatus
 
@@ -144,6 +144,24 @@ class Database:
                 content_text TEXT,
                 data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clarifications (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                question TEXT NOT NULL,
+                proposed_tool_name TEXT,
+                proposed_arguments_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                decided_at TEXT,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
@@ -324,10 +342,125 @@ class Database:
         ]
 
     def count_rows(self, table_name: str) -> int:
-        if table_name not in {"sessions", "messages", "events", "tool_calls", "permissions", "tools", "proposed_tools", "reflections", "artifacts"}:
+        if table_name not in {
+            "sessions",
+            "messages",
+            "events",
+            "tool_calls",
+            "permissions",
+            "tools",
+            "proposed_tools",
+            "reflections",
+            "artifacts",
+            "clarifications",
+        }:
             raise ValueError(f"Unsupported table name: {table_name}")
         connection = self._ensure_connection()
         return int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+    def create_clarification(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        kind: str,
+        question: str,
+        proposed_tool_name: str | None,
+        proposed_arguments: dict[str, object],
+        expires_in_seconds: int = 120,
+    ) -> ClarificationRecord:
+        self.ensure_session(session_id)
+        clarification_id = f"clar_{uuid4()}"
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=expires_in_seconds)
+        connection = self._ensure_connection()
+        connection.execute(
+            """
+            INSERT INTO clarifications
+                (id, session_id, run_id, kind, question, proposed_tool_name, proposed_arguments_json, status, created_at, expires_at, decided_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clarification_id,
+                session_id,
+                run_id,
+                kind,
+                question,
+                proposed_tool_name,
+                json.dumps(proposed_arguments, sort_keys=True),
+                "pending",
+                now.isoformat(),
+                expires_at.isoformat(),
+                None,
+            ),
+        )
+        connection.commit()
+        record = self.get_clarification(clarification_id)
+        if record is None:
+            raise RuntimeError(f"Failed to create clarification: {clarification_id}")
+        return record
+
+    def get_clarification(self, clarification_id: str) -> ClarificationRecord | None:
+        connection = self._ensure_connection()
+        row = connection.execute(
+            """
+            SELECT id, session_id, run_id, kind, question, proposed_tool_name, proposed_arguments_json, status, created_at, expires_at, decided_at
+            FROM clarifications
+            WHERE id = ?
+            """,
+            (clarification_id,),
+        ).fetchone()
+        return self._clarification_from_row(row) if row is not None else None
+
+    def get_pending_clarification(self, session_id: str) -> ClarificationRecord | None:
+        connection = self._ensure_connection()
+        row = connection.execute(
+            """
+            SELECT id, session_id, run_id, kind, question, proposed_tool_name, proposed_arguments_json, status, created_at, expires_at, decided_at
+            FROM clarifications
+            WHERE session_id = ? AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        return self._clarification_from_row(row) if row is not None else None
+
+    def update_clarification_status(self, clarification_id: str, status: str) -> ClarificationRecord | None:
+        if status not in {"pending", "accepted", "rejected", "expired"}:
+            raise ValueError(f"Unsupported clarification status: {status}")
+        connection = self._ensure_connection()
+        decided_at = None if status == "pending" else self._now_iso()
+        connection.execute(
+            "UPDATE clarifications SET status = ?, decided_at = ? WHERE id = ?",
+            (status, decided_at, clarification_id),
+        )
+        connection.commit()
+        return self.get_clarification(clarification_id)
+
+    def expire_due_clarifications(self, session_id: str) -> list[ClarificationRecord]:
+        connection = self._ensure_connection()
+        now = datetime.now(UTC)
+        rows = connection.execute(
+            """
+            SELECT id, session_id, run_id, kind, question, proposed_tool_name, proposed_arguments_json, status, created_at, expires_at, decided_at
+            FROM clarifications
+            WHERE session_id = ? AND status = 'pending'
+            """,
+            (session_id,),
+        ).fetchall()
+        expired = [
+            self._clarification_from_row(row)
+            for row in rows
+            if AssistantEvent.parse_timestamp(row[9]) <= now
+        ]
+        for record in expired:
+            connection.execute(
+                "UPDATE clarifications SET status = 'expired', decided_at = ? WHERE id = ?",
+                (now.isoformat(), record.id),
+            )
+        connection.commit()
+        return [record for record in expired if record is not None]
 
     def create_artifact(
         self,
@@ -546,6 +679,22 @@ class Database:
             created_from_message=row[8],
             created_at=row[9],
             updated_at=row[10],
+        )
+
+    @staticmethod
+    def _clarification_from_row(row) -> ClarificationRecord:
+        return ClarificationRecord(
+            id=row[0],
+            session_id=row[1],
+            run_id=row[2],
+            kind=row[3],
+            question=row[4],
+            proposed_tool_name=row[5],
+            proposed_arguments_json=row[6],
+            status=row[7],
+            created_at=AssistantEvent.parse_timestamp(row[8]),
+            expires_at=AssistantEvent.parse_timestamp(row[9]),
+            decided_at=AssistantEvent.parse_timestamp(row[10]) if row[10] is not None else None,
         )
 
     @staticmethod

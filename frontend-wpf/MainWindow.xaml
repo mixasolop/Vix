@@ -280,6 +280,28 @@
                 </Grid>
             </TabItem>
 
+            <TabItem Header="Browser">
+                <Grid Margin="0,14,0,0">
+                    <Border Style="{StaticResource PanelBorderStyle}">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Controlled Browser" Style="{StaticResource PanelTitleStyle}" />
+                            <ScrollViewer Grid.Row="1" Style="{StaticResource PanelScrollViewerStyle}">
+                                <StackPanel MaxWidth="920" HorizontalAlignment="Left">
+                                    <TextBlock Text="Stage 5 uses an isolated browser session. Vix can read pages and prepare actions, but submit/book/order/pay actions must stop at permission."
+                                               Style="{StaticResource MutedTextStyle}"
+                                               Margin="0,0,0,18" />
+                                    <ItemsControl ItemsSource="{Binding BrowserStatus}" ItemTemplate="{StaticResource StatusItemTemplate}" />
+                                </StackPanel>
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+
             <TabItem Header="Developer">
                 <Grid Margin="0,14,0,0">
                     <Grid.RowDefinitions>

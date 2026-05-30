@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from app.api.browser_routes import router as browser_router
 from app.api.chat_routes import router as chat_router
 from app.api.context_routes import router as context_router
 from app.api.permission_routes import router as permission_router
@@ -15,6 +16,8 @@ from app.api.tool_routes import router as tool_router
 from app.assistant.llm_client import DeterministicLLMClient, LLMClient, OpenAILLMClient, redact_secrets
 from app.assistant.orchestrator import Orchestrator
 from app.assistant.policy import PermissionManager, PolicyEngine
+from app.assistant.semantic_router import SemanticRouter
+from app.browser.session_manager import BrowserSessionManager
 from app.config import AppConfig, load_config, load_config_from_file
 from app.context.window_tracker import WindowTracker
 from app.db.database import Database
@@ -38,7 +41,9 @@ def create_app(
     config: AppConfig | None = None,
     reload_config_from_file: bool | None = None,
     context_tracker: WindowTracker | None = None,
+    browser_manager: BrowserSessionManager | None = None,
     start_context_tracker: bool = False,
+    semantic_router: SemanticRouter | None = None,
 ) -> FastAPI:
     should_reload_config = config is None if reload_config_from_file is None else reload_config_from_file
     user_supplied_llm_client = llm_client is not None
@@ -46,7 +51,8 @@ def create_app(
     database = Database(database_path or config.database_path)
     event_bus = EventBus()
     context_tracker = context_tracker or WindowTracker()
-    registry = registry or build_default_registry(context_tracker)
+    browser_manager = browser_manager or BrowserSessionManager()
+    registry = registry or build_default_registry(context_tracker, browser_manager=browser_manager)
     llm_client = llm_client or _build_llm_client(config)
     permission_manager = PermissionManager(database)
     policy_engine = PolicyEngine()
@@ -58,6 +64,7 @@ def create_app(
         policy_engine=policy_engine,
         llm_client=llm_client,
         context_tracker=context_tracker,
+        semantic_router=semantic_router,
     )
 
     @asynccontextmanager
@@ -91,13 +98,14 @@ def create_app(
             LOGGER.info("backend shutdown beginning")
             if app.state.start_context_tracker:
                 app.state.context_tracker.stop()
+            await app.state.browser_manager.stop()
             app.state.database.close()
             LOGGER.info("backend shutdown complete")
 
     app = FastAPI(
         title="Desktop Assistant Backend",
         version="0.2.0",
-        description="Stage 4 local context acquisition, general answer, weather, and safe tool proposal runtime.",
+        description="Stage 5 controlled browser, local context, general answer, weather, and safe tool proposal runtime.",
         lifespan=lifespan,
     )
     app.state.config = config
@@ -108,6 +116,7 @@ def create_app(
     app.state.policy_engine = policy_engine
     app.state.orchestrator = orchestrator
     app.state.context_tracker = context_tracker
+    app.state.browser_manager = browser_manager
     app.state.start_context_tracker = start_context_tracker
     app.state.reload_config_from_file = should_reload_config
     app.state.user_supplied_llm_client = user_supplied_llm_client
@@ -154,7 +163,7 @@ def create_app(
         return {
             "status": "ok",
             "service": "desktop-assistant-backend",
-            "stage": "4.0",
+            "stage": "5.0",
         }
 
     @app.get("/ai/status", response_model=AIStatusResponse)
@@ -163,6 +172,7 @@ def create_app(
         return await _get_ai_status(app.state.config, app.state.orchestrator.llm_client)
 
     app.include_router(chat_router)
+    app.include_router(browser_router)
     app.include_router(context_router)
     app.include_router(tool_router)
     app.include_router(permission_router)

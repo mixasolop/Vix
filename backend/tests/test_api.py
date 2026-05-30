@@ -101,12 +101,52 @@ class FakeSelectedTextStrategy:
         )
 
 
+class StaticSelectedTextStrategy:
+    def __init__(self, text: str, *, status: str = "success", error: str | None = None) -> None:
+        self.text = text
+        self.status = status
+        self.error = error
+
+    async def capture(self, target: WindowInfo) -> SelectedTextResult:
+        return SelectedTextResult(
+            status=self.status,
+            text=self.text,
+            context_window=target,
+            restored_clipboard=True,
+            error=self.error,
+        )
+
+
+class SequentialSelectedTextStrategy:
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = list(texts)
+
+    async def capture(self, target: WindowInfo) -> SelectedTextResult:
+        text = self.texts.pop(0)
+        return SelectedTextResult(
+            status="success",
+            text=text,
+            context_window=target,
+            restored_clipboard=True,
+        )
+
+
+def _plan_statuses(event: dict[str, object]) -> dict[int, str]:
+    plan = event["data"]["plan"]
+    return {step["number"]: step["status"] for step in plan["steps"]}
+
+
+def _plan_step(event: dict[str, object], number: int) -> dict[str, object]:
+    plan = event["data"]["plan"]
+    return next(step for step in plan["steps"] if step["number"] == number)
+
+
 def test_health(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["stage"] == "4.0"
+    assert response.json()["stage"] == "5.0"
 
 
 def test_sqlite_runtime_pragmas_and_tools_table(client: TestClient) -> None:
@@ -177,6 +217,76 @@ def test_rule_based_planner_maps_stage_one_commands(message: str, tool_name: str
 
 def test_rule_based_planner_rejects_unknown_open_targets() -> None:
     assert Planner().propose_tool_call("open spotify") is None
+
+
+def test_rule_based_planner_builds_multi_step_tool_sequence() -> None:
+    sequence = Planner().propose_tool_sequence("open calculator then open notepad")
+
+    assert [proposal.name for proposal in sequence] == ["launch_app", "launch_app"]
+    assert [proposal.arguments for proposal in sequence] == [{"app_name": "calculator"}, {"app_name": "notepad"}]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "don't open calculator",
+        "do not open calculator",
+        "don't launch calculator",
+        "do not run calculator",
+        "I don't want you to open calculator",
+        "please don't open calculator",
+        "never open calculator",
+        "stop, don't open calculator",
+        "what happens if I open calculator?",
+        "how do I open calculator?",
+    ],
+)
+def test_rule_based_planner_does_not_launch_without_affirmative_intent(message: str) -> None:
+    assert Planner().propose_tool_call(message) is None
+
+
+@pytest.mark.parametrize("message", ["open calculator", "please open calculator"])
+def test_action_decision_executes_affirmative_launch_requests(message: str) -> None:
+    decision = Planner().decide_action(message)
+
+    assert decision.intent_type == "EXECUTE_TOOL"
+    assert decision.tool_proposal is not None
+    assert decision.tool_proposal.name == "launch_app"
+    assert decision.tool_proposal.arguments == {"app_name": "calculator"}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "don't open calculator",
+        "do not open calculator",
+        "I don't want you to open calculator",
+    ],
+)
+def test_action_decision_no_action_for_negated_launch_requests(message: str) -> None:
+    decision = Planner().decide_action(message)
+
+    assert decision.intent_type == "NO_ACTION"
+    assert decision.tool_proposal is None
+    assert "not open Calculator" in decision.reason
+
+
+@pytest.mark.parametrize("message", ["what happens if I open calculator?", "how do I open calculator?"])
+def test_action_decision_answer_only_for_hypothetical_or_instructional_launch_questions(message: str) -> None:
+    decision = Planner().decide_action(message)
+
+    assert decision.intent_type == "ANSWER_ONLY"
+    assert decision.tool_proposal is None
+
+
+@pytest.mark.parametrize("message", ["calculator", "notepad", "maybe calculator"])
+def test_action_decision_asks_clarification_for_ambiguous_app_mentions(message: str) -> None:
+    decision = Planner().decide_action(message)
+
+    assert decision.intent_type == "ASK_CLARIFICATION"
+    assert decision.tool_proposal is not None
+    assert decision.tool_proposal.name == "launch_app"
+    assert decision.missing_input == "confirmation"
 
 
 def test_policy_engine_allows_low_risk_implemented_tools() -> None:
@@ -614,6 +724,10 @@ def test_normal_chat_uses_llm_reply_without_tool_execution(tmp_path) -> None:
         "assistant_message_created",
     ]
     assert events[2]["data"]["category"] == "GENERAL_ANSWER"
+    assert _plan_statuses(events[3]) == {1: "completed", 2: "pending"}
+    assert _plan_step(events[3], 2)["title"] == "Generate answer"
+    assert _plan_statuses(events[4]) == {1: "completed", 2: "running"}
+    assert _plan_statuses(events[5]) == {1: "completed", 2: "completed"}
     assert events[-1]["data"]["message"] == "Normal assistant reply."
     assert llm_client.complete_messages[0][-1] == {"role": "user", "content": "What is recursion?"}
     assert app.state.database.count_rows("tool_calls") == 0
@@ -763,8 +877,287 @@ def test_calculator_launch_requests_use_local_tool_not_llm(tmp_path, message: st
         "assistant_message_created",
     ]
     assert events[2]["data"]["category"] == "LOCAL_TOOL"
+    assert _plan_statuses(events[4]) == {1: "completed", 2: "completed", 3: "pending"}
+    assert _plan_step(events[4], 2)["tool_name"] == "launch_app"
+    assert _plan_step(events[4], 2)["risk_level"] == "LOW_WRITE"
+    assert _plan_statuses(events[5]) == {1: "completed", 2: "completed", 3: "running"}
+    assert _plan_statuses(events[6]) == {1: "completed", 2: "completed", 3: "completed"}
+    assert _plan_step(events[6], 3)["tool_name"] == "launch_app"
     assert events[4]["data"]["tool_name"] == "launch_app"
     assert app.state.database.count_rows("tool_calls") == 1
+
+
+def test_failed_local_tool_marks_execute_step_failed(tmp_path) -> None:
+    class FailingLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("LLM complete should not be called for local tool failures.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposal should not be called for registered tool failures.")
+
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+
+    async def fake_launch_failure(arguments: dict[str, object]) -> ToolResult:
+        return ToolResult(tool="launch_app", status="failed", output={}, error="calculator failed to launch")
+
+    registry.register(metadata, fake_launch_failure)
+    app = create_app(
+        database_path=tmp_path / "failed-local-tool.sqlite3",
+        registry=registry,
+        llm_client=FailingLLMClient(),
+        config=AppConfig(),
+    )
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "open calculator"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(8)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "tool_selected",
+        "tool_started",
+        "tool_result",
+        "assistant_message_created",
+    ]
+    assert events[6]["data"]["status"] == "failed"
+    assert _plan_statuses(events[6]) == {1: "completed", 2: "completed", 3: "failed"}
+    assert events[-1]["data"]["message"] == "calculator failed to launch"
+    assert app.state.database.count_rows("tool_calls") == 1
+    assert app.state.database.count_rows("reflections") == 1
+
+
+def test_multi_step_launch_request_uses_task_loop(tmp_path) -> None:
+    class FailingLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("LLM complete should not be called for deterministic multi-step tools.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposals should not be created for implemented multi-step tools.")
+
+    registry = build_default_registry()
+    metadata = registry.get("launch_app")
+    assert metadata is not None
+    launched_apps: list[str] = []
+
+    async def fake_launch(arguments: dict[str, object]) -> ToolResult:
+        launched_apps.append(str(arguments["app_name"]))
+        return ToolResult(
+            tool="launch_app",
+            status="success",
+            output={"status": "success", "message": f"Launched {arguments['app_name']}."},
+        )
+
+    registry.register(metadata, fake_launch)
+    app = create_app(
+        database_path=tmp_path / "multi-step.sqlite3",
+        registry=registry,
+        llm_client=FailingLLMClient(),
+        config=AppConfig(),
+    )
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "open calculator then open notepad"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(12)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "task_loop_started",
+        "task_step_decided",
+        "task_observation_added",
+        "task_step_decided",
+        "task_observation_added",
+        "task_step_decided",
+        "task_loop_completed",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "MULTI_STEP"
+    assert [item["arguments"] for item in events[2]["data"]["tool_sequence"]] == [
+        {"app_name": "calculator"},
+        {"app_name": "notepad"},
+    ]
+    assert launched_apps == ["calculator", "notepad"]
+    assert events[10]["data"]["stop_reason"] == "answered"
+    assert events[-1]["data"]["message"] == "Completed the multi-step task."
+    assert app.state.database.count_rows("tool_calls") == 2
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "don't open calculator",
+        "do not open calculator",
+        "I don't want you to open calculator",
+    ],
+)
+def test_negated_calculator_requests_confirm_no_action_without_tool_or_llm(tmp_path, message: str) -> None:
+    class FailingLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("LLM complete should not be called for explicit no-action requests.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposal should not be called for non-action calculator requests.")
+
+    app = create_app(database_path=tmp_path / "no-action-calculator.sqlite3", llm_client=FailingLLMClient(), config=AppConfig())
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": message})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(5)]
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "NO_ACTION"
+    assert events[2]["data"]["intent_type"] == "NO_ACTION"
+    assert events[-1]["data"]["message"] == "Okay, I will not open Calculator."
+    assert "tool_selected" not in event_types
+    assert app.state.database.count_rows("tool_calls") == 0
+
+
+def test_dont_open_calculator_safe_no_action_response(tmp_path) -> None:
+    class FailingLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("LLM complete should not be called for safe no-action requests.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposal should not be called for safe no-action requests.")
+
+    app = create_app(database_path=tmp_path / "safe-no-action.sqlite3", llm_client=FailingLLMClient(), config=AppConfig())
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": "don't open calculator"})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(5)]
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "NO_ACTION"
+    assert events[2]["data"]["intent_type"] == "NO_ACTION"
+    assert events[-1]["data"]["message"] == "Okay, I will not open Calculator."
+    assert not {"tool_selected", "tool_started", "tool_result"} & set(event_types)
+    assert app.state.database.count_rows("tool_calls") == 0
+
+
+@pytest.mark.parametrize("message", ["what happens if I open calculator?", "how do I open calculator?"])
+def test_instructional_calculator_questions_answer_without_tool(tmp_path, message: str) -> None:
+    class FakeLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            return "No action taken."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposal should not be called for calculator explanation questions.")
+
+    app = create_app(database_path=tmp_path / "answer-only-calculator.sqlite3", llm_client=FakeLLMClient(), config=AppConfig())
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": message})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(7)]
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "llm_response_started",
+        "llm_response_finished",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "GENERAL_ANSWER"
+    assert events[2]["data"]["intent_type"] == "ANSWER_ONLY"
+    assert "tool_selected" not in event_types
+    assert app.state.database.count_rows("tool_calls") == 0
+
+
+@pytest.mark.parametrize("message", ["calculator", "notepad", "maybe calculator"])
+def test_ambiguous_app_mentions_ask_clarification_without_tool_or_llm(tmp_path, message: str) -> None:
+    class FailingLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("LLM complete should not be called for deterministic clarification requests.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Tool proposal should not be called for ambiguous app mentions.")
+
+    app = create_app(database_path=tmp_path / "clarify-calculator.sqlite3", llm_client=FailingLLMClient(), config=AppConfig())
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+
+            response = test_client.post("/chat", json={"message": message})
+            assert response.status_code == 200
+
+            events = [websocket.receive_json() for _ in range(6)]
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "clarification_required",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "ASK_CLARIFICATION"
+    assert events[2]["data"]["intent_type"] == "ASK_CLARIFICATION"
+    assert events[4]["data"]["proposed_tool_name"] == "launch_app"
+    assert events[-1]["data"]["message"].startswith("Do you want me to open ")
+    assert "tool_selected" not in event_types
+    assert app.state.database.count_rows("tool_calls") == 0
 
 
 def test_weather_today_without_location_asks_for_city(client: TestClient) -> None:
@@ -957,6 +1350,131 @@ def test_classifier_current_window_uses_context_window_not_foreground_window() -
     assert classification.tool_proposal.name == "get_context_window_info"
 
 
+def test_classifier_multi_step_launch_request_routes_to_task_loop() -> None:
+    classification = classify_request("open calculator then open notepad")
+
+    assert classification.category == RequestCategory.multi_step
+    assert [proposal.name for proposal in classification.tool_sequence] == ["launch_app", "launch_app"]
+    assert [proposal.arguments for proposal in classification.tool_sequence] == [
+        {"app_name": "calculator"},
+        {"app_name": "notepad"},
+    ]
+    assert classification.tool_proposal is None
+
+
+def test_classifier_multi_step_launch_request_with_and_routes_to_task_loop() -> None:
+    classification = classify_request("open calculator and open notepad")
+
+    assert classification.category == RequestCategory.multi_step
+    assert [proposal.arguments for proposal in classification.tool_sequence] == [
+        {"app_name": "calculator"},
+        {"app_name": "notepad"},
+    ]
+    assert classification.tool_proposal is None
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_category"),
+    [
+        ("don't open calculator", RequestCategory.no_action),
+        ("what is weather in calculator app?", RequestCategory.realtime_info),
+        ("what does selected word 'weather' mean?", RequestCategory.local_context),
+        ("how do I open calculator?", RequestCategory.general_answer),
+        ("open calculator and what is weather in Warsaw", RequestCategory.ask_clarification),
+    ],
+)
+def test_classifier_priority_collisions_do_not_execute_lower_priority_tools(message: str, expected_category: RequestCategory) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == expected_category
+    assert not (
+        classification.category == RequestCategory.local_tool
+        and classification.tool_proposal is not None
+        and classification.tool_proposal.name == "launch_app"
+    )
+
+
+def test_classifier_weather_mentioning_calculator_app_does_not_launch_calculator() -> None:
+    classification = classify_request("what is weather in calculator app?")
+
+    assert classification.category == RequestCategory.realtime_info
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "get_weather"
+    assert classification.tool_proposal.arguments["location"] == "calculator app"
+
+
+def test_classifier_mixed_local_tool_and_weather_asks_clarification() -> None:
+    classification = classify_request("open calculator and what is weather in Warsaw")
+
+    assert classification.category == RequestCategory.ask_clarification
+    assert classification.tool_proposal is None
+    assert classification.tool_sequence == []
+    assert classification.missing_input == "intent"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_tool"),
+    [
+        ("open calculator", "launch_app"),
+        ("please open calculator", "launch_app"),
+    ],
+)
+def test_classifier_affirmative_launch_requests_route_to_local_tool(message: str, expected_tool: str) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.local_tool
+    assert classification.action_decision is not None
+    assert classification.action_decision.intent_type == "EXECUTE_TOOL"
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == expected_tool
+    assert classification.tool_proposal.arguments == {"app_name": "calculator"}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "don't open calculator",
+        "do not open calculator",
+        "I don't want you to open calculator",
+    ],
+)
+def test_classifier_negated_launch_requests_route_to_no_action(message: str) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.no_action
+    assert classification.action_decision is not None
+    assert classification.action_decision.intent_type == "NO_ACTION"
+    assert classification.tool_proposal is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "what happens if I open calculator?",
+        "how do I open calculator?",
+    ],
+)
+def test_classifier_non_affirmative_launch_requests_do_not_route_to_local_tool(message: str) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.general_answer
+    assert classification.action_decision is not None
+    assert classification.action_decision.intent_type == "ANSWER_ONLY"
+    assert classification.tool_proposal is None
+
+
+@pytest.mark.parametrize("message", ["calculator", "notepad", "maybe calculator"])
+def test_classifier_ambiguous_app_mentions_ask_clarification(message: str) -> None:
+    classification = classify_request(message)
+
+    assert classification.category == RequestCategory.ask_clarification
+    assert classification.action_decision is not None
+    assert classification.action_decision.intent_type == "ASK_CLARIFICATION"
+    assert classification.tool_proposal is not None
+    assert classification.tool_proposal.name == "launch_app"
+    assert classification.missing_input == "confirmation"
+
+
 def test_get_weather_output_includes_scientific_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     today = date.today().isoformat()
 
@@ -1105,6 +1623,7 @@ def test_llm_failure_returns_graceful_assistant_error(tmp_path) -> None:
         "assistant_message_created",
     ]
     assert events[5]["data"]["status"] == "failed"
+    assert _plan_statuses(events[5]) == {1: "completed", 2: "failed"}
     assert events[-1]["data"]["message"] == "I could not get an AI answer right now. Please try again."
 
 
@@ -1441,7 +1960,7 @@ def test_selected_text_request_captures_artifact_and_uses_llm_context(tmp_path) 
             response = test_client.post("/chat", json={"message": "What does selected word mean?"})
             assert response.status_code == 200
 
-            events = [websocket.receive_json() for _ in range(13)]
+            events = [websocket.receive_json() for _ in range(14)]
 
         context_response = test_client.get("/context/status")
 
@@ -1451,6 +1970,7 @@ def test_selected_text_request_captures_artifact_and_uses_llm_context(tmp_path) 
         "assistant_thinking_started",
         "request_classified",
         "plan_created",
+        "context_intent_detected",
         "context_window_selected",
         "tool_selected",
         "tool_started",
@@ -1462,16 +1982,308 @@ def test_selected_text_request_captures_artifact_and_uses_llm_context(tmp_path) 
         "assistant_message_created",
     ]
     assert events[2]["data"]["category"] == "LOCAL_CONTEXT"
-    assert events[5]["data"]["tool_name"] == "get_selected_text"
-    assert events[8]["data"]["artifact_type"] == "selected_text"
-    assert events[8]["data"]["content_preview"] == "recursion"
-    assert events[9]["data"]["artifact"]["type"] == "selected_text"
-    assert events[9]["data"]["artifact"]["content_text"] == "recursion"
+    assert events[4]["data"]["source"] == "selected_text"
+    assert events[4]["data"]["operation"] == "define"
+    assert events[6]["data"]["tool_name"] == "get_selected_text"
+    assert _plan_statuses(events[6]) == {1: "completed", 2: "completed", 3: "pending", 4: "pending"}
+    assert _plan_step(events[6], 2)["tool_name"] == "get_selected_text"
+    assert _plan_statuses(events[7]) == {1: "completed", 2: "completed", 3: "running", 4: "pending"}
+    assert _plan_statuses(events[8]) == {1: "completed", 2: "completed", 3: "completed", 4: "pending"}
+    assert _plan_statuses(events[11]) == {1: "completed", 2: "completed", 3: "completed", 4: "running"}
+    assert _plan_statuses(events[12]) == {1: "completed", 2: "completed", 3: "completed", 4: "completed"}
+    assert events[9]["data"]["artifact_type"] == "selected_text"
+    assert events[9]["data"]["content_preview"] == "recursion"
+    assert events[10]["data"]["artifact"]["type"] == "selected_text"
+    assert events[10]["data"]["artifact"]["content_text"] == "recursion"
+    assert events[10]["data"]["artifact"]["data"]["run_id"] == response.json()["run_id"]
+    assert events[10]["data"]["artifact"]["data"]["content_hash"]
     assert "recursion" in llm_client.messages[-1]["content"]
     assert context_response.status_code == 200
     assert context_response.json()["last_context_artifact"]["content_text"] == "recursion"
     assert app.state.database.count_rows("artifacts") == 1
     assert app.state.database.count_rows("tool_calls") == 1
+
+
+def test_highlighted_question_runs_context_tool_before_llm_answer(tmp_path) -> None:
+    class CapturingLLMClient:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            self.messages = messages
+            assert "How many legs does a spider have?" in str(messages[-1]["content"])
+            assert "Do not say you cannot see the selection" in str(messages[0]["content"])
+            return "The answer is eight."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            raise AssertionError("Highlighted context requests should not propose missing tools.")
+
+    context_window = _window(hwnd=1707, title="Google - Chrome", process_name="chrome.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(tracker, StaticSelectedTextStrategy("How many legs does a spider have?"))
+    app = create_app(
+        database_path=tmp_path / "highlight-answer.sqlite3",
+        registry=registry,
+        llm_client=CapturingLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            response = test_client.post("/chat", json={"message": "what is the answer to what i have highlighted"})
+            assert response.status_code == 200
+            run_id = response.json()["run_id"]
+            events = [websocket.receive_json() for _ in range(14)]
+
+    assert [event["type"] for event in events] == [
+        "user_message_received",
+        "assistant_thinking_started",
+        "request_classified",
+        "plan_created",
+        "context_intent_detected",
+        "context_window_selected",
+        "tool_selected",
+        "tool_started",
+        "tool_result",
+        "context_captured",
+        "artifact_created",
+        "llm_response_started",
+        "llm_response_finished",
+        "assistant_message_created",
+    ]
+    assert events[2]["data"]["category"] == "LOCAL_CONTEXT"
+    assert events[4]["data"]["operation"] == "answer_question"
+    assert events[6]["data"]["tool_name"] == "get_selected_text"
+    assert events[10]["data"]["artifact"]["data"]["run_id"] == run_id
+    assert events[10]["data"]["artifact"]["content_text"] == "How many legs does a spider have?"
+    assistant_message = events[-1]["data"]["message"].lower()
+    assert "eight" in assistant_message
+    assert "can't see" not in assistant_message
+    assert "cannot see" not in assistant_message
+
+
+def test_what_did_i_highlight_reports_selection_without_llm(tmp_path) -> None:
+    class NoLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("Report-only selected text should not call the LLM.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            return None
+
+    context_window = _window(hwnd=1708, title="Google - Chrome", process_name="chrome.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(tracker, StaticSelectedTextStrategy("How many legs does a spider have?"))
+    app = create_app(
+        database_path=tmp_path / "highlight-report.sqlite3",
+        registry=registry,
+        llm_client=NoLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            response = test_client.post("/chat", json={"message": "what did i highlight"})
+            assert response.status_code == 200
+            events = [websocket.receive_json() for _ in range(12)]
+
+    assert "llm_response_started" not in [event["type"] for event in events]
+    assert events[4]["type"] == "context_intent_detected"
+    assert events[4]["data"]["operation"] == "report"
+    assert events[-1]["type"] == "assistant_message_created"
+    assert events[-1]["data"]["message"] == "You highlighted: How many legs does a spider have?"
+
+
+def test_highlighted_question_empty_capture_does_not_use_stale_context_or_llm(tmp_path) -> None:
+    class NoLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("Failed context capture must not call the LLM.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            return None
+
+    context_window = _window(hwnd=1709, title="Google - Chrome", process_name="chrome.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(tracker, StaticSelectedTextStrategy("", status="failed", error="Ctrl+C produced no text."))
+    app = create_app(
+        database_path=tmp_path / "highlight-empty.sqlite3",
+        registry=registry,
+        llm_client=NoLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            response = test_client.post("/chat", json={"message": "what is the answer to the highlighted question"})
+            assert response.status_code == 200
+            events = [websocket.receive_json() for _ in range(10)]
+
+    event_types = [event["type"] for event in events]
+    assert "artifact_created" not in event_types
+    assert "llm_response_started" not in event_types
+    assert events[8]["type"] == "tool_result"
+    assert events[8]["data"]["status"] == "failed"
+    assert "couldn't capture" in events[-1]["data"]["message"].lower()
+    assert app.state.database.count_rows("artifacts") == 0
+
+
+def test_context_answer_uses_current_run_selection_not_previous_artifact(tmp_path) -> None:
+    class GuardedLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            prompt = str(messages[-1]["content"])
+            assert "How many legs does a spider have?" in prompt
+            assert "If you could only eat one fruit forever" not in prompt
+            return "The answer is eight."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            return None
+
+    context_window = _window(hwnd=1710, title="Google - Chrome", process_name="chrome.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(
+        tracker,
+        SequentialSelectedTextStrategy(
+            [
+                "If you could only eat one fruit forever, which one?",
+                "How many legs does a spider have?",
+            ]
+        ),
+    )
+    app = create_app(
+        database_path=tmp_path / "highlight-stale.sqlite3",
+        registry=registry,
+        llm_client=GuardedLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            first = test_client.post("/chat", json={"message": "what did i highlight"})
+            assert first.status_code == 200
+            first_events = [websocket.receive_json() for _ in range(12)]
+
+            second = test_client.post(
+                "/chat",
+                json={
+                    "conversation_id": first.json()["conversation_id"],
+                    "message": "what is the answer to what i highlighted",
+                },
+            )
+            assert second.status_code == 200
+            second_events = [websocket.receive_json() for _ in range(14)]
+
+    assert first_events[10]["data"]["artifact"]["data"]["run_id"] == first.json()["run_id"]
+    assert second_events[10]["data"]["artifact"]["data"]["run_id"] == second.json()["run_id"]
+    assert second_events[10]["data"]["artifact"]["content_text"] == "How many legs does a spider have?"
+    assert "eight" in second_events[-1]["data"]["message"].lower()
+    assert app.state.database.count_rows("artifacts") == 2
+
+
+def test_clipboard_fuzzy_request_uses_clipboard_tool(tmp_path) -> None:
+    class NoLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            raise AssertionError("Report-only clipboard text should not call the LLM.")
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            return None
+
+    tracker = FakeWindowTracker(context=_window(hwnd=1711, title="notes.txt - Notepad", process_name="notepad.exe"))
+    registry = build_default_registry(tracker)
+    metadata = registry.get("get_clipboard_text")
+    assert metadata is not None
+
+    async def fake_clipboard(arguments: dict[str, object]) -> ToolResult:
+        return ToolResult(
+            tool="get_clipboard_text",
+            status="success",
+            output={
+                "status": "success",
+                "message": "Clipboard text captured.",
+                "text": "Welcome to Build A Ring Farm!",
+                "length": len("Welcome to Build A Ring Farm!"),
+                "source": "clipboard",
+                "captured_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    registry.register(metadata, fake_clipboard)
+    app = create_app(
+        database_path=tmp_path / "clipboard-fuzzy.sqlite3",
+        registry=registry,
+        llm_client=NoLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            response = test_client.post("/chat", json={"message": "what word i have in clip board"})
+            assert response.status_code == 200
+            events = [websocket.receive_json() for _ in range(11)]
+
+    assert events[2]["data"]["category"] == "LOCAL_CONTEXT"
+    assert events[4]["data"]["source"] == "clipboard"
+    assert events[5]["data"]["tool_name"] == "get_clipboard_text"
+    assert events[-1]["data"]["message"] == "Clipboard contains: Welcome to Build A Ring Farm!"
+
+
+def test_selected_work_mean_uses_selected_text_context(tmp_path) -> None:
+    class DefinitionLLMClient:
+        async def complete(self, messages: list[dict[str, object]]) -> str:
+            assert "recursion" in str(messages[-1]["content"])
+            return "Recursion means a process that refers back to itself."
+
+        async def create_plan(self, user_text: str, tools: list[object]) -> AssistantPlan:
+            return AssistantPlan(goal="Fake plan", steps=[])
+
+        async def propose_tool_spec(self, user_message: str, existing_tools: list[object]) -> ProposedToolDraft | None:
+            return None
+
+    context_window = _window(hwnd=1712, title="main.py - Visual Studio Code", process_name="Code.exe")
+    tracker = FakeWindowTracker(context=context_window)
+    registry = build_default_registry(tracker, StaticSelectedTextStrategy("recursion"))
+    app = create_app(
+        database_path=tmp_path / "selected-work.sqlite3",
+        registry=registry,
+        llm_client=DefinitionLLMClient(),
+        config=AppConfig(),
+        context_tracker=tracker,
+    )
+
+    with TestClient(app) as test_client:
+        with test_client.websocket_connect("/ws/events") as websocket:
+            assert websocket.receive_json()["type"] == "event_stream_connected"
+            response = test_client.post("/chat", json={"message": "what does selected work mean"})
+            assert response.status_code == 200
+            events = [websocket.receive_json() for _ in range(14)]
+
+    assert events[4]["data"]["source"] == "selected_text"
+    assert events[4]["data"]["operation"] == "define"
+    assert events[6]["data"]["tool_name"] == "get_selected_text"
+    assert "recursion" in events[-1]["data"]["message"].lower()
 
 
 def test_context_status_endpoint_returns_tracker_snapshot(tmp_path) -> None:

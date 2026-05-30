@@ -30,3 +30,18 @@ class ArtifactRecord:
     content_text: str | None
     data_json: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class ClarificationRecord:
+    id: str
+    session_id: str
+    run_id: str
+    kind: str
+    question: str
+    proposed_tool_name: str | None
+    proposed_arguments_json: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    decided_at: datetime | None

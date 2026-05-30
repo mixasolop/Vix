@@ -217,6 +217,27 @@ public sealed class ContextStatusDto
     public Dictionary<string, object?>? LastContextArtifact { get; set; }
 }
 
+public sealed class BrowserStatusDto
+{
+    [JsonPropertyName("current_url")]
+    public string? CurrentUrl { get; set; }
+
+    [JsonPropertyName("page_title")]
+    public string? PageTitle { get; set; }
+
+    [JsonPropertyName("text_preview")]
+    public string? TextPreview { get; set; }
+
+    [JsonPropertyName("last_browser_artifact")]
+    public Dictionary<string, object?>? LastBrowserArtifact { get; set; }
+
+    [JsonPropertyName("last_browser_action")]
+    public string? LastBrowserAction { get; set; }
+
+    [JsonPropertyName("risk_classification")]
+    public string? RiskClassification { get; set; }
+}
+
 public sealed class AssistantEventDto
 {
     [JsonPropertyName("event_id")]

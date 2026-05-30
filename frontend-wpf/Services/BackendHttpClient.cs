@@ -91,6 +91,15 @@ public sealed class BackendHttpClient : IDisposable
         return contextStatus ?? throw new InvalidOperationException("Backend returned an empty context status response.");
     }
 
+    public async Task<BrowserStatusDto> GetBrowserStatusAsync(CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync("/browser/status", cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var browserStatus = await response.Content.ReadFromJsonAsync<BrowserStatusDto>(JsonOptions, cancellationToken);
+        return browserStatus ?? throw new InvalidOperationException("Backend returned an empty browser status response.");
+    }
+
     public async Task ApprovePermissionAsync(string permissionId, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.PostAsync($"/permissions/{permissionId}/approve", content: null, cancellationToken);

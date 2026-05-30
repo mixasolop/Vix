@@ -5,8 +5,10 @@ import json
 import logging
 from typing import Any
 
+from app.browser.session_manager import BrowserSessionManager
 from app.context.window_tracker import WindowTracker
 from app.schemas.tools import ConfirmationPolicy, RetryPolicy, RiskLevel, ToolDefinition, ToolResult, ToolStatus
+from app.tools.browser_tools import build_browser_tool_executors
 from app.tools.context_tools import SelectedTextCaptureStrategy, build_context_tool_executors
 from app.tools.system_tools import get_current_time, launch_app
 from app.tools.weather_tools import get_weather
@@ -43,6 +45,12 @@ class ToolRegistry:
 
     def list_tools(self) -> list[ToolDefinition]:
         return [runtime.metadata for runtime in self._tools.values()]
+
+    def validate_arguments(self, name: str, arguments: dict[str, object]) -> str | None:
+        runtime = self._tools.get(name)
+        if runtime is None:
+            return f"Unknown tool: {name}"
+        return self._validate_required_arguments(runtime.metadata, arguments)
 
     async def execute(self, name: str, arguments: dict[str, object]) -> ToolResult:
         LOGGER.info("tool execution requested | name=%s | arguments=%s", name, _json_for_log(arguments))
@@ -126,11 +134,14 @@ class ToolRegistry:
 def build_default_registry(
     window_tracker: WindowTracker | None = None,
     selected_text_strategy: SelectedTextCaptureStrategy | None = None,
+    browser_manager: BrowserSessionManager | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     window_tracker = window_tracker or WindowTracker()
+    browser_manager = browser_manager or BrowserSessionManager()
     context_executors = build_context_tool_executors(window_tracker, selected_text_strategy)
-    for definition, executor in _default_tool_runtimes(context_executors):
+    browser_executors = build_browser_tool_executors(browser_manager)
+    for definition, executor in _default_tool_runtimes(context_executors, browser_executors):
         registry.register(definition, executor)
     registry.register(_list_available_tools_definition(), _build_list_available_tools_executor(registry))
     return registry
@@ -258,6 +269,63 @@ def _selected_text_output_schema() -> dict[str, Any]:
     )
 
 
+def _browser_snapshot_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "text_preview": {"type": "string"},
+            "text_length": {"type": "number"},
+            "links_count": {"type": "number"},
+            "forms_count": {"type": "number"},
+            "snapshot": {"type": "object"},
+        },
+        ["status", "message", "url", "title", "snapshot"],
+    )
+
+
+def _browser_links_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "links": {"type": "array", "items": {"type": "object"}},
+            "snapshot": {"type": "object"},
+        },
+        ["status", "message", "links"],
+    )
+
+
+def _browser_forms_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "forms": {"type": "array", "items": {"type": "object"}},
+            "snapshot": {"type": "object"},
+        },
+        ["status", "message", "forms"],
+    )
+
+
+def _browser_screenshot_output_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "status": {"type": "string"},
+            "message": {"type": "string"},
+            "screenshot": {"type": "object"},
+            "snapshot": {"type": "object"},
+        },
+        ["status", "message", "screenshot"],
+    )
+
+
 def _list_available_tools_definition() -> ToolDefinition:
     return ToolDefinition(
         name="list_available_tools",
@@ -298,7 +366,10 @@ def _build_list_available_tools_executor(registry: ToolRegistry) -> ToolExecutor
     return list_available_tools
 
 
-def _default_tool_runtimes(context_executors: dict[str, ToolExecutor]) -> list[tuple[ToolDefinition, ToolExecutor | None]]:
+def _default_tool_runtimes(
+    context_executors: dict[str, ToolExecutor],
+    browser_executors: dict[str, ToolExecutor],
+) -> list[tuple[ToolDefinition, ToolExecutor | None]]:
     return [
         (
             ToolDefinition(
@@ -505,44 +576,139 @@ def _default_tool_runtimes(context_executors: dict[str, ToolExecutor]) -> list[t
         (
             ToolDefinition(
                 name="browser_open",
-                description="Open a browser page by URL.",
-                status=ToolStatus.planned,
+                description="Open a URL in Vix's isolated controlled Playwright browser session.",
+                status=ToolStatus.implemented,
                 input_schema=_object_schema({"url": {"type": "string"}}, ["url"]),
-                output_schema=_success_output_schema(),
+                output_schema=_browser_snapshot_output_schema(),
                 risk_level=RiskLevel.low_write,
                 confirmation_policy=ConfirmationPolicy.none,
-                timeout_seconds=10,
+                timeout_seconds=20,
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
-            None,
+            browser_executors["browser_open"],
         ),
         (
             ToolDefinition(
-                name="browser_search",
-                description="Search the web in the browser and return candidate results.",
-                status=ToolStatus.planned,
-                input_schema=_object_schema({"query": {"type": "string"}}, ["query"]),
-                output_schema=_object_schema({"results": {"type": "array", "items": {"type": "object"}}}),
+                name="browser_read_page",
+                description="Read the active controlled browser page and return a structured snapshot.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_browser_snapshot_output_schema(),
                 risk_level=RiskLevel.read,
                 confirmation_policy=ConfirmationPolicy.none,
-                timeout_seconds=30,
+                timeout_seconds=15,
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
-            None,
+            browser_executors["browser_read_page"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_extract_links",
+                description="Extract links from the active controlled browser page using internal element IDs.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_browser_links_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_extract_links"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_extract_forms",
+                description="Extract forms and fields from the active controlled browser page using internal element IDs.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_browser_forms_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_extract_forms"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_screenshot",
+                description="Capture a screenshot of the controlled browser page. Privacy-sensitive read.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({}),
+                output_schema=_browser_screenshot_output_schema(),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_screenshot"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_click",
+                description="Click a known browser element ID. Stage 5 supports safe navigation clicks only.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({"element_id": {"type": "string"}}, ["element_id"]),
+                output_schema=_browser_snapshot_output_schema(),
+                risk_level=RiskLevel.low_write,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_click"],
         ),
         (
             ToolDefinition(
                 name="browser_fill",
-                description="Fill fields in a browser page up to a draft or confirmation boundary.",
-                status=ToolStatus.planned,
-                input_schema=_object_schema({"selector": {"type": "string"}, "value": {"type": "string"}}, ["selector", "value"]),
-                output_schema=_success_output_schema(),
+                description="Fill a known browser field ID as a draft. This never submits the form.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({"element_id": {"type": "string"}, "value": {"type": "string"}}, ["element_id", "value"]),
+                output_schema=_browser_snapshot_output_schema(),
+                risk_level=RiskLevel.medium_write,
+                confirmation_policy=ConfirmationPolicy.before_execute,
+                timeout_seconds=15,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_fill"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_submit_form",
+                description="Submit a known browser form ID. Always requires explicit permission.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({"form_id": {"type": "string"}}, ["form_id"]),
+                output_schema=_browser_snapshot_output_schema(),
                 risk_level=RiskLevel.high_risk,
                 confirmation_policy=ConfirmationPolicy.before_execute,
                 timeout_seconds=15,
                 retry_policy=RetryPolicy(max_attempts=1),
             ),
-            None,
+            browser_executors["browser_submit_form"],
+        ),
+        (
+            ToolDefinition(
+                name="browser_search",
+                description="Open a search results page in the controlled browser and return candidate result links.",
+                status=ToolStatus.implemented,
+                input_schema=_object_schema({"query": {"type": "string"}}, ["query"]),
+                output_schema=_object_schema(
+                    {
+                        "status": {"type": "string"},
+                        "message": {"type": "string"},
+                        "query": {"type": "string"},
+                        "url": {"type": "string"},
+                        "title": {"type": "string"},
+                        "results": {"type": "array", "items": {"type": "object"}},
+                        "snapshot": {"type": "object"},
+                    },
+                    ["status", "message", "query", "results"],
+                ),
+                risk_level=RiskLevel.read,
+                confirmation_policy=ConfirmationPolicy.none,
+                timeout_seconds=30,
+                retry_policy=RetryPolicy(max_attempts=1),
+            ),
+            browser_executors["browser_search"],
         ),
         (
             ToolDefinition(
